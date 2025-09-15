@@ -16,6 +16,11 @@ int
 FS::format()
 {
     std::cout << "FS::format()\n";
+
+    // Initalize FAT
+
+
+    // Mark all blocks as free (except root and FAT)
     return 0;
 }
 
