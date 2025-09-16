@@ -1,4 +1,6 @@
 #include <iostream>
+#include <cstring>
+#include <vector>
 #include "fs.h"
 
 FS::FS()
@@ -16,6 +18,8 @@ int
 FS::format()
 {
     std::cout << "FS::format()\n";
+
+    int ret_val = 0;
 
     // Set root(0) and FAT(1) slots to used
     fat[ROOT_BLOCK] = FAT_EOF;
@@ -36,15 +40,26 @@ FS::format()
     }
 
     // Clear root block
-    disk.write(ROOT_BLOCK, blockBuffer);
-
+    ret_val = disk.write(ROOT_BLOCK, blockBuffer);
+    if (ret_val == 0)
+    {
+        return 1;
+    }
     // Write formatted FAT to disk
     disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat));
+    if (ret_val != 0)
+    {
+        return 2;
+    }
 
     // Clear all other blocks
     for (int i = 2; i < number_of_blocks; i++)
     {
-        disk.write(i, blockBuffer);
+        ret_val = disk.write(i, blockBuffer);
+        if (ret_val != 0)
+        {
+            return 3;
+        }
     }
 
     return 0;
@@ -56,6 +71,111 @@ int
 FS::create(std::string filepath)
 {
     std::cout << "FS::create(" << filepath << ")\n";
+
+    bool fileDataRead = false;
+    std::string line;
+    std::string completedText;
+    while (!fileDataRead)
+    {
+        std::getline(std::cin, line);
+        if (line.empty())
+        {
+            fileDataRead = true;
+            std::cout << "Finished reading file.\n";
+        }
+        else 
+        {
+            completedText.append(line + "\n");
+        }
+    }
+
+    std::vector<uint16_t> freeBlocks;
+    int textLeft = completedText.size();
+    int textWritten = 0;
+
+    while (textLeft > 0)
+    {
+        int freeBlock = -1;
+        int number_of_blocks = disk.get_no_blocks();
+        for (int i = 0; i < number_of_blocks; i++)
+        {
+            if (fat[i] == FAT_FREE)
+            {
+                freeBlock = i;
+                break;  // Free block found, break loop
+            }
+        }
+
+        if (freeBlock == -1)
+        {
+            std::cout << "Memory Full, no blocks free.\n";
+            return 4;
+        }
+
+        freeBlocks.push_back(freeBlock);
+
+        uint8_t textBuffer[BLOCK_SIZE]{};
+        int textToSend = std::min(textLeft, int(BLOCK_SIZE));
+        memcpy(textBuffer, completedText.data() + textWritten, textToSend);
+
+        if (disk.write(freeBlock, textBuffer) != 0)
+        {
+            std::cout << "Error: Failed to write block to FAT[" << freeBlock << "]\n";
+            return 5;
+        }
+
+        textWritten = textWritten + textToSend;
+        textLeft = textLeft - textToSend;
+    }
+    
+    for (int i = 0; i < freeBlocks.size(); i++)
+    {
+        if (i + 1 < freeBlocks.size())  // If NOT last block
+        {
+            fat[freeBlocks[i]] = freeBlocks[i + 1]; // Link first FAT block to the next in chain
+        }
+        else 
+        {
+            fat[freeBlocks[i]] = FAT_EOF;   // Set FAT block to last block in chain
+        }
+    }
+
+    disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)); // Update FAT in disk
+
+    dir_entry newFile{};    // Initialize struct to 0
+    strncpy(newFile.file_name, filepath.c_str(), sizeof(newFile.file_name) - 1);    // Copy filepath to struct
+    
+    newFile.file_name[sizeof(newFile.file_name) - 1] = '\0';
+    newFile.size = completedText.size();    // Set size of the contents of the file to the new file
+    newFile.first_blk = freeBlocks.empty() ? 0: freeBlocks[0];
+    newFile.type = TYPE_FILE;
+    newFile.access_rights = READ | WRITE; // Read | Write Permissions
+
+    uint8_t rootBuffer[BLOCK_SIZE];
+    disk.read(ROOT_BLOCK, rootBuffer);
+
+    // Find a free `dir_entry` slot (all zeros)
+    dir_entry* entries = reinterpret_cast<dir_entry*>(rootBuffer);
+    bool entryAvailable = false;
+    for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); ++i)
+    {
+        if (entries[i].file_name[0] == '\0')
+        {
+            entries[i] = newFile;
+            entryAvailable = true;
+            break;
+        }
+    }
+
+    if (!entryAvailable)
+    {
+        std::cout << "Error: Root Directory Full.\n";
+        return 6;
+    }
+
+    // Write back root block
+    disk.write(ROOT_BLOCK, rootBuffer);
+
     return 0;
 }
 
