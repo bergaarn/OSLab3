@@ -17,10 +17,36 @@ FS::format()
 {
     std::cout << "FS::format()\n";
 
-    // Initalize FAT
-
+    // Set root(0) and FAT(1) slots to used
+    fat[ROOT_BLOCK] = FAT_EOF;
+    fat[FAT_BLOCK] = FAT_EOF;
 
     // Mark all blocks as free (except root and FAT)
+    const unsigned number_of_blocks = disk.get_no_blocks();
+    for(int i = 2; i < number_of_blocks; i++)
+    {
+        fat[i] = FAT_FREE;
+    }
+
+    // Set block buffer to all 0's
+    uint8_t blockBuffer[BLOCK_SIZE];
+    for (int i = 0; i < BLOCK_SIZE; i++)
+    {
+        blockBuffer[i] = 0;
+    }
+
+    // Clear root block
+    disk.write(ROOT_BLOCK, blockBuffer);
+
+    // Write formatted FAT to disk
+    disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat));
+
+    // Clear all other blocks
+    for (int i = 2; i < number_of_blocks; i++)
+    {
+        disk.write(i, blockBuffer);
+    }
+
     return 0;
 }
 
