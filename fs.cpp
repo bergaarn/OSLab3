@@ -41,12 +41,12 @@ FS::format()
 
     // Clear root block
     ret_val = disk.write(ROOT_BLOCK, blockBuffer);
-    if (ret_val == 0)
+    if (ret_val != 0)
     {
         return 1;
     }
     // Write formatted FAT to disk
-    disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat));
+    ret_val = disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat));
     if (ret_val != 0)
     {
         return 2;
@@ -71,6 +71,23 @@ int
 FS::create(std::string filepath)
 {
     std::cout << "FS::create(" << filepath << ")\n";
+    
+    // Check for duplicate file
+    uint8_t duplicateBuffer[BLOCK_SIZE]{};
+    disk.read(ROOT_BLOCK, duplicateBuffer);
+    dir_entry* directory_entries = reinterpret_cast<dir_entry*>(duplicateBuffer);
+
+    for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++)
+    {
+        if (directory_entries[i].file_name[0] != '\0')  
+        {
+            if (strcmp(directory_entries[i].file_name, filepath.c_str()) == 0)
+            {
+                std::cout << "Error:FS:Create: Filename already exists.\n";
+                return 4;
+            }
+        }
+    }
 
     bool fileDataRead = false;
     std::string line;
@@ -109,7 +126,7 @@ FS::create(std::string filepath)
         if (freeBlock == -1)
         {
             std::cout << "Memory Full, no blocks free.\n";
-            return 4;
+            return 5;
         }
 
         freeBlocks.push_back(freeBlock);
@@ -121,7 +138,7 @@ FS::create(std::string filepath)
         if (disk.write(freeBlock, textBuffer) != 0)
         {
             std::cout << "Error: Failed to write block to FAT[" << freeBlock << "]\n";
-            return 5;
+            return 6;
         }
 
         textWritten = textWritten + textToSend;
@@ -170,7 +187,7 @@ FS::create(std::string filepath)
     if (!entryAvailable)
     {
         std::cout << "Error: Root Directory Full.\n";
-        return 6;
+        return 7;
     }
 
     // Write back root block
