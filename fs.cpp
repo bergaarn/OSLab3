@@ -18,8 +18,6 @@ FS::~FS()
 int
 FS::format()
 {
-    int ret_val = 0;
-
     // Set root(0) and FAT(1) slots to used
     fat[ROOT_BLOCK] = FAT_EOF;
     fat[FAT_BLOCK] = FAT_EOF;
@@ -39,14 +37,12 @@ FS::format()
     }
 
     // Clear root block
-    ret_val = disk.write(ROOT_BLOCK, blockBuffer);
-    if (ret_val != 0)
+    if (disk.write(ROOT_BLOCK, blockBuffer) != 0)
     {
         return 1;
     }
     // Write formatted FAT to disk
-    ret_val = disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat));
-    if (ret_val != 0)
+    if (disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
     {
         return 2;
     }
@@ -54,8 +50,7 @@ FS::format()
     // Clear all other blocks
     for (int i = 2; i < number_of_blocks; i++)
     {
-        ret_val = disk.write(i, blockBuffer);
-        if (ret_val != 0)
+        if (disk.write(i, blockBuffer) != 0)
         {
             return 3;
         }
@@ -71,17 +66,21 @@ FS::create(std::string filepath)
 {
     // Check for duplicate file
     uint8_t duplicateBuffer[BLOCK_SIZE]{};
-    disk.read(ROOT_BLOCK, duplicateBuffer);
+    if (disk.read(ROOT_BLOCK, duplicateBuffer) != 0)
+    {
+        return 1;
+    }
     dir_entry* directory_entries = reinterpret_cast<dir_entry*>(duplicateBuffer);
 
     for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++)
     {
+        // If filename isnt empty
         if (directory_entries[i].file_name[0] != '\0')  
         {
+            // Return if filename already exists
             if (strcmp(directory_entries[i].file_name, filepath.c_str()) == 0)
             {
-                std::cout << "Error:FS:Create: Filename already exists.\n";
-                return 4;
+                return 2;
             }
         }
     }
@@ -120,10 +119,10 @@ FS::create(std::string filepath)
             }
         }
 
+        // Return if no blocks are free
         if (freeBlock == -1)
         {
-            std::cout << "Memory Full, no blocks free.\n";
-            return 5;
+            return 3;
         }
 
         freeBlocks.push_back(freeBlock);
@@ -132,10 +131,10 @@ FS::create(std::string filepath)
         int textToSend = std::min(textLeft, int(BLOCK_SIZE));
         memcpy(textBuffer, completedText.data() + textWritten, textToSend);
 
+        // Return if failed to write to the free block
         if (disk.write(freeBlock, textBuffer) != 0)
         {
-            std::cout << "Error: Failed to write block to FAT[" << freeBlock << "]\n";
-            return 6;
+            return 4;
         }
 
         textWritten = textWritten + textToSend;
@@ -184,7 +183,7 @@ FS::create(std::string filepath)
     if (!entryAvailable)
     {
         std::cout << "Error: Root Directory Full.\n";
-        return 7;
+        return 5;
     }
 
     // Write back root block
@@ -200,7 +199,6 @@ FS::cat(std::string filepath)
     uint8_t rootBuffer[BLOCK_SIZE]{};
     if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
     {
-        std::cout << "Error:FS:cat: Unable to read rootBuffer" << std::endl;
         return 1;
     }
 
@@ -221,8 +219,7 @@ FS::cat(std::string filepath)
 
     if (!targetFile)
     {
-        std::cout << "Failed to find file: \"" << filepath << "\"\n"; 
-        return 8;
+        return 2;
     }
 
     uint16_t fileBlock = targetFile->first_blk;
@@ -233,8 +230,7 @@ FS::cat(std::string filepath)
         uint8_t blockBuffer[BLOCK_SIZE]{};
         if (disk.read(fileBlock, blockBuffer) != 0)
         {
-            std::cout << "Error:FS:Cat: Could not read disk block: " << fileBlock << "\n";
-            return 9;
+            return 3;
         }      
 
         int bytesToPrint = std::min(bytesToRead, BLOCK_SIZE);
@@ -256,10 +252,10 @@ FS::ls()
     uint8_t rootBuffer[BLOCK_SIZE]{};
     if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
     {
-        std::cout << "Error:FS:ls: Failed to read ROOT_BLOCK" << std::endl;
         return 1;
     }
 
+    // Leave room for filename
     std::cout << std::left << std::setw(28) << " name" << std::right << " size" << std::endl;
 
     dir_entry* rootDir_entries = reinterpret_cast<dir_entry*>(rootBuffer);
