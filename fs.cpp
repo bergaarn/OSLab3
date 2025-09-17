@@ -75,7 +75,7 @@ FS::create(std::string filepath)
     uint8_t duplicateBuffer[BLOCK_SIZE]{};
     if (disk.read(ROOT_BLOCK, duplicateBuffer) != 0)
     {
-        return 1;
+        return 2;
     }
     dir_entry* directory_entries = reinterpret_cast<dir_entry*>(duplicateBuffer);
 
@@ -87,7 +87,7 @@ FS::create(std::string filepath)
             // Return if filename already exists
             if (strcmp(directory_entries[i].file_name, filepath.c_str()) == 0)
             {
-                return 2;
+                return 3;
             }
         }
     }
@@ -129,7 +129,7 @@ FS::create(std::string filepath)
         // Return if no blocks are free
         if (freeBlock == -1)
         {
-            return 3;
+            return 4;
         }
 
         // Add free block to file's allocated blocks
@@ -143,12 +143,12 @@ FS::create(std::string filepath)
         // Return if failed to write to the free block
         if (disk.write(freeBlock, textBuffer) != 0)
         {
-            return 4;
+            return 5;
         }
 
         // Update amount of text left to write to blocks
-        textWritten =+ textToSend;
-        textLeft =- textToSend;
+        textWritten += textToSend;
+        textLeft -= textToSend;
     }
     
     for (int i = 0; i < freeBlocks.size(); i++)
@@ -165,7 +165,7 @@ FS::create(std::string filepath)
 
     if (disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0) // Update FAT in disk
     {
-        return 5;
+        return 6;
     } 
     dir_entry newFile{};    // Initialize struct to 0
     strncpy(newFile.file_name, filepath.c_str(), sizeof(newFile.file_name) - 1);    // Copy filepath to struct
@@ -179,7 +179,7 @@ FS::create(std::string filepath)
     uint8_t rootBuffer[BLOCK_SIZE];
     if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
     {
-        return 6;
+        return 7;
     }
 
     // Find a free `dir_entry` slot (all zeros)
@@ -198,13 +198,13 @@ FS::create(std::string filepath)
     // root directory full
     if (!entryAvailable)
     {
-        return 7;
+        return 8;
     }
 
     // Write back root block
     if (disk.write(ROOT_BLOCK, rootBuffer) != 0)
     {
-        return 8;
+        return 9;
     }
 
     return 0;
@@ -299,7 +299,147 @@ FS::ls()
 int
 FS::cp(std::string sourcepath, std::string destpath)
 {
-    std::cout << "FS::cp(" << sourcepath << "," << destpath << ")\n";
+    uint8_t rootBuffer[BLOCK_SIZE]{};
+    if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
+    {
+        return 1;
+    }
+
+    dir_entry* rootDir_entries = reinterpret_cast<dir_entry*>(rootBuffer);
+    int number_of_entries = BLOCK_SIZE / sizeof(dir_entry);
+    dir_entry* sourceFile = nullptr;
+    bool destpathAlreadyExists = false;
+    
+    for (int i = 0; i < number_of_entries; i++)
+    {
+        if (rootDir_entries[i].file_name[0] != '\0')
+        {
+            // Find the <sourcepath> in directory
+            if(strcmp(rootDir_entries[i].file_name, sourcepath.c_str()) == 0)
+            {
+                sourceFile = &rootDir_entries[i];
+            }
+
+            // Check if <destpath> already exists in directory
+            if (strcmp(rootDir_entries[i].file_name, destpath.c_str()) == 0)
+            {
+                // If so return
+                destpathAlreadyExists = true;
+            }
+        }
+    }
+
+    if (destpathAlreadyExists)
+    {
+        //std::cout << "ERROR: destpath filename already exists" << std::endl;
+        return 2;
+    }
+
+
+    // Extract file data from sourcefile's blocks
+    std::string fileData;
+    uint16_t block = sourceFile->first_blk;
+    int bytesToRead = sourceFile->size;
+
+    while (block != FAT_EOF && bytesToRead > 0)
+    {
+        uint8_t blockBuffer[BLOCK_SIZE]{};
+        if (disk.read(block, blockBuffer) != 0)
+        {
+            return 3;
+        }
+
+        int bytesToWrite = std::min(bytesToRead, bytesToWrite);
+        fileData.append(reinterpret_cast<char*>(blockBuffer), bytesToWrite);
+
+        bytesToRead -= bytesToWrite;
+        block = fat[block];
+    }
+
+    // Find free blocks to use for new file
+    std::vector<uint16_t> freeBlocks;
+    int bytesLeftToWrite = fileData.size();
+    int bytesWritten = 0;
+
+    while (bytesLeftToWrite > 0)
+    {
+        int freeBlock = -1;
+        int number_of_blocks = disk.get_no_blocks();
+
+        for (int i = 0; i < number_of_blocks; i++)
+        {
+            if (fat[i] == FAT_FREE)
+            {
+                freeBlock = i;
+                break;
+            }
+        }
+
+        if (freeBlock == -1)
+        {
+            return 4;
+        }
+
+        freeBlocks.push_back(freeBlock);
+
+        uint8_t blockBuffer[BLOCK_SIZE]{};
+        int bytesToWrite = std::min(bytesLeftToWrite, BLOCK_SIZE);
+        memcpy(blockBuffer, fileData.data() + bytesWritten, bytesToWrite);
+
+        if (disk.write(freeBlock, blockBuffer) != 0)
+        {
+            return 5;
+        }
+
+        bytesWritten += bytesToWrite;
+        bytesLeftToWrite -= bytesToWrite;
+    }
+
+    for (int i = 0; i < freeBlocks.size(); i++)
+    {
+        if (i + 1 < freeBlocks.size())
+        {
+            fat[freeBlocks[i]] = freeBlocks[i + 1];
+        }
+        else 
+        {
+            fat[freeBlocks[i]] = FAT_EOF;
+        }
+    }
+
+    if (disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
+    {
+        return 6;
+    }
+
+    dir_entry newFile{};
+    strncpy(newFile.file_name, destpath.c_str(), sizeof(newFile.file_name)-1);
+    newFile.file_name[sizeof(newFile.file_name)-1] = '\0';
+    newFile.size = fileData.size();
+    newFile.first_blk = freeBlocks.empty() ? 0 : freeBlocks[0];
+    newFile.type = TYPE_FILE;
+    newFile.access_rights = READ | WRITE;
+
+    // find free slot in root
+    bool slotFound = false;
+    for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); ++i)
+    {
+        if (rootDir_entries[i].file_name[0] == '\0')
+        {
+            rootDir_entries[i] = newFile;
+            slotFound = true;
+            break;
+        }
+    }
+
+    if (!slotFound)
+        return 7; // no free root entry
+
+    if (disk.write(ROOT_BLOCK, rootBuffer) != 0)
+        return 8; // failed to update root
+        // Otherwise create an exact copy of the <sourcepath> as a new file called <destpath>
+
+
     return 0;
 }
 
