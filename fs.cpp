@@ -299,6 +299,7 @@ FS::ls()
 int
 FS::cp(std::string sourcepath, std::string destpath)
 {
+    // Read in the root directory
     uint8_t rootBuffer[BLOCK_SIZE]{};
     if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
     {
@@ -328,13 +329,15 @@ FS::cp(std::string sourcepath, std::string destpath)
             }
         }
     }
-
+    if (!sourceFile)
+    {
+        return 2;
+    }
     if (destpathAlreadyExists)
     {
         //std::cout << "ERROR: destpath filename already exists" << std::endl;
-        return 2;
+        return 3;
     }
-
 
     // Extract file data from sourcefile's blocks
     std::string fileData;
@@ -346,10 +349,10 @@ FS::cp(std::string sourcepath, std::string destpath)
         uint8_t blockBuffer[BLOCK_SIZE]{};
         if (disk.read(block, blockBuffer) != 0)
         {
-            return 3;
+            return 4;
         }
 
-        int bytesToWrite = std::min(bytesToRead, bytesToWrite);
+        int bytesToWrite = std::min(bytesToRead, BLOCK_SIZE);
         fileData.append(reinterpret_cast<char*>(blockBuffer), bytesToWrite);
 
         bytesToRead -= bytesToWrite;
@@ -360,7 +363,6 @@ FS::cp(std::string sourcepath, std::string destpath)
     std::vector<uint16_t> freeBlocks;
     int bytesLeftToWrite = fileData.size();
     int bytesWritten = 0;
-
     while (bytesLeftToWrite > 0)
     {
         int freeBlock = -1;
@@ -375,9 +377,10 @@ FS::cp(std::string sourcepath, std::string destpath)
             }
         }
 
+        // Return if no free blocks are avaiable (Directory is full)
         if (freeBlock == -1)
         {
-            return 4;
+            return 5;
         }
 
         freeBlocks.push_back(freeBlock);
@@ -388,13 +391,14 @@ FS::cp(std::string sourcepath, std::string destpath)
 
         if (disk.write(freeBlock, blockBuffer) != 0)
         {
-            return 5;
+            return 6;
         }
 
         bytesWritten += bytesToWrite;
         bytesLeftToWrite -= bytesToWrite;
     }
 
+    // Update the FAT by writing the blocks into the new file's chain
     for (int i = 0; i < freeBlocks.size(); i++)
     {
         if (i + 1 < freeBlocks.size())
@@ -406,39 +410,42 @@ FS::cp(std::string sourcepath, std::string destpath)
             fat[freeBlocks[i]] = FAT_EOF;
         }
     }
-
     if (disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
     {
-        return 6;
+        return 7;
     }
 
-    dir_entry newFile{};
-    strncpy(newFile.file_name, destpath.c_str(), sizeof(newFile.file_name)-1);
-    newFile.file_name[sizeof(newFile.file_name)-1] = '\0';
-    newFile.size = fileData.size();
-    newFile.first_blk = freeBlocks.empty() ? 0 : freeBlocks[0];
+    // Create a new entry in the root directory for the file
+    dir_entry newFile{};    
+    strncpy(newFile.file_name, destpath.c_str(), sizeof(newFile.file_name) - 1);
+    newFile.file_name[sizeof(newFile.file_name) - 1] = '\0';  // Add null terminator to end of filename
+    newFile.size = fileData.size(); // Assign data size to new file entry from string
+    newFile.first_blk = freeBlocks.empty() ? 0 : freeBlocks[0]; // Fail safe if the file has no data in it
     newFile.type = TYPE_FILE;
     newFile.access_rights = READ | WRITE;
 
     // find free slot in root
-    bool slotFound = false;
+    bool entryAvailable = false;
     for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); ++i)
     {
         if (rootDir_entries[i].file_name[0] == '\0')
         {
             rootDir_entries[i] = newFile;
-            slotFound = true;
+            entryAvailable = true;
             break;
         }
     }
 
-    if (!slotFound)
-        return 7; // no free root entry
-
+    // Root directory is full
+    if (!entryAvailable)
+    {
+        return 8; // no free root entry
+    }
+        
     if (disk.write(ROOT_BLOCK, rootBuffer) != 0)
-        return 8; // failed to update root
-        // Otherwise create an exact copy of the <sourcepath> as a new file called <destpath>
-
+    {
+        return 9; 
+    }
 
     return 0;
 }
@@ -448,7 +455,63 @@ FS::cp(std::string sourcepath, std::string destpath)
 int
 FS::mv(std::string sourcepath, std::string destpath)
 {
-    std::cout << "FS::mv(" << sourcepath << "," << destpath << ")\n";
+
+    // Check max length for file name
+    if (destpath.size() >= 56)
+    {
+        //std::cout << "Error: Filename too long (55 characters maximum)" << std::endl;
+        return 1;
+    }
+
+    // Read in the root directory
+    uint8_t rootBuffer[BLOCK_SIZE]{};
+    if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
+    {
+        return 2;
+    }
+
+    dir_entry* rootDir_entries = reinterpret_cast<dir_entry*>(rootBuffer);
+    int number_of_entries = BLOCK_SIZE / sizeof(dir_entry);
+    dir_entry* sourceFile = nullptr;
+    bool destpathAlreadyExists = false;
+    
+    for (int i = 0; i < number_of_entries; i++)
+    {
+        if (rootDir_entries[i].file_name[0] != '\0')
+        {
+            // Find the <sourcepath> in directory
+            if (strcmp(rootDir_entries[i].file_name, sourcepath.c_str()) == 0)
+            {
+                sourceFile = &rootDir_entries[i];
+            }
+
+            // Check if <destpath> already exists in directory
+            if (strcmp(rootDir_entries[i].file_name, destpath.c_str()) == 0)
+            {
+                // If so return
+                destpathAlreadyExists = true;
+            }
+        }
+    }
+    if (!sourceFile)
+    {
+        //std::cout << "ERROR: sourcefile was not found" << std::endl;
+        return 2;
+    }
+    if (destpathAlreadyExists)
+    {
+        //std::cout << "ERROR: destpath filename already exists" << std::endl;
+        return 3;
+    }
+
+    strncpy(sourceFile->file_name,destpath.c_str(), sizeof(sourceFile->file_name - 1));
+    sourceFile->file_name[sizeof(sourceFile->file_name) - 1] = '\0';
+
+    if (disk.write(ROOT_BLOCK, rootBuffer) != 0)
+    {
+        return 4;        
+    }
+
     return 0;
 }
 
