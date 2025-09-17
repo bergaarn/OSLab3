@@ -112,10 +112,11 @@ FS::create(std::string filepath)
         int number_of_blocks = disk.get_no_blocks();
         for (int i = 0; i < number_of_blocks; i++)
         {
+            // Free block found
             if (fat[i] == FAT_FREE)
             {
                 freeBlock = i;
-                break;  // Free block found, break loop
+                break;  
             }
         }
 
@@ -125,9 +126,11 @@ FS::create(std::string filepath)
             return 3;
         }
 
+        // Add free block to file's allocated blocks
         freeBlocks.push_back(freeBlock);
 
         uint8_t textBuffer[BLOCK_SIZE]{};
+        // Amount of data to write (full block 4096 or less if last block for file)
         int textToSend = std::min(textLeft, int(BLOCK_SIZE));
         memcpy(textBuffer, completedText.data() + textWritten, textToSend);
 
@@ -137,8 +140,9 @@ FS::create(std::string filepath)
             return 4;
         }
 
-        textWritten = textWritten + textToSend;
-        textLeft = textLeft - textToSend;
+        // Update amount of text left to write to blocks
+        textWritten =+ textToSend;
+        textLeft =- textToSend;
     }
     
     for (int i = 0; i < freeBlocks.size(); i++)
@@ -153,8 +157,10 @@ FS::create(std::string filepath)
         }
     }
 
-    disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)); // Update FAT in disk
-
+    if (disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0) // Update FAT in disk
+    {
+        return 5;
+    } 
     dir_entry newFile{};    // Initialize struct to 0
     strncpy(newFile.file_name, filepath.c_str(), sizeof(newFile.file_name) - 1);    // Copy filepath to struct
     
@@ -165,7 +171,10 @@ FS::create(std::string filepath)
     newFile.access_rights = READ | WRITE; // Read | Write Permissions
 
     uint8_t rootBuffer[BLOCK_SIZE];
-    disk.read(ROOT_BLOCK, rootBuffer);
+    if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
+    {
+        return 6;
+    }
 
     // Find a free `dir_entry` slot (all zeros)
     dir_entry* entries = reinterpret_cast<dir_entry*>(rootBuffer);
@@ -180,14 +189,17 @@ FS::create(std::string filepath)
         }
     }
 
+    // root directory full
     if (!entryAvailable)
     {
-        std::cout << "Error: Root Directory Full.\n";
-        return 5;
+        return 7;
     }
 
     // Write back root block
-    disk.write(ROOT_BLOCK, rootBuffer);
+    if (disk.write(ROOT_BLOCK, rootBuffer) != 0)
+    {
+        return 8;
+    }
 
     return 0;
 }
