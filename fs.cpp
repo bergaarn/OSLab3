@@ -1,11 +1,12 @@
 #include <iostream>
 #include <cstring>
 #include <vector>
+#include <iomanip>
 #include "fs.h"
 
 FS::FS()
 {
-    std::cout << "FS::FS()... Creating file system\n";
+
 }
 
 FS::~FS()
@@ -17,8 +18,6 @@ FS::~FS()
 int
 FS::format()
 {
-    std::cout << "FS::format()\n";
-
     int ret_val = 0;
 
     // Set root(0) and FAT(1) slots to used
@@ -70,8 +69,6 @@ FS::format()
 int
 FS::create(std::string filepath)
 {
-    std::cout << "FS::create(" << filepath << ")\n";
-    
     // Check for duplicate file
     uint8_t duplicateBuffer[BLOCK_SIZE]{};
     disk.read(ROOT_BLOCK, duplicateBuffer);
@@ -200,7 +197,55 @@ FS::create(std::string filepath)
 int
 FS::cat(std::string filepath)
 {
-    std::cout << "FS::cat(" << filepath << ")\n";
+    uint8_t rootBuffer[BLOCK_SIZE]{};
+    if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
+    {
+        std::cout << "Error:FS:cat: Unable to read rootBuffer" << std::endl;
+        return 1;
+    }
+
+    dir_entry* directory_entries = reinterpret_cast<dir_entry*>(rootBuffer);
+    dir_entry* targetFile = nullptr;
+
+    for (int i = 0; i < BLOCK_SIZE /sizeof(dir_entry); i++)
+    {
+        if (directory_entries[i].file_name[0] != '\0')
+        {
+            if (strcmp(directory_entries[i].file_name, filepath.c_str()) == 0)
+            {
+                targetFile = &directory_entries[i];
+                break;
+            }
+        }
+    }
+
+    if (!targetFile)
+    {
+        std::cout << "Failed to find file: \"" << filepath << "\"\n"; 
+        return 8;
+    }
+
+    uint16_t fileBlock = targetFile->first_blk;
+    int bytesToRead = targetFile->size;
+
+    while (fileBlock != FAT_EOF && bytesToRead > 0)
+    {
+        uint8_t blockBuffer[BLOCK_SIZE]{};
+        if (disk.read(fileBlock, blockBuffer) != 0)
+        {
+            std::cout << "Error:FS:Cat: Could not read disk block: " << fileBlock << "\n";
+            return 9;
+        }      
+
+        int bytesToPrint = std::min(bytesToRead, BLOCK_SIZE);
+        std::cout.write(reinterpret_cast<char*>(blockBuffer), bytesToPrint);
+
+        bytesToRead -= bytesToPrint;
+        fileBlock = fat[fileBlock];
+    }
+
+    std::cout << std::endl;
+
     return 0;
 }
 
@@ -208,7 +253,29 @@ FS::cat(std::string filepath)
 int
 FS::ls()
 {
-    std::cout << "FS::ls()\n";
+    uint8_t rootBuffer[BLOCK_SIZE]{};
+    if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
+    {
+        std::cout << "Error:FS:ls: Failed to read ROOT_BLOCK" << std::endl;
+        return 1;
+    }
+
+    std::cout << std::left << std::setw(28) << " name" << std::right << " size" << std::endl;
+
+    dir_entry* rootDir_entries = reinterpret_cast<dir_entry*>(rootBuffer);
+    for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++)
+    {
+        if (rootDir_entries[i].file_name[0] != '\0')
+        {
+            std::cout 
+                << " " << std::left << std::setw(28) 
+                << rootDir_entries[i].file_name << std::right
+                << rootDir_entries[i].size << std::endl;
+        }
+    }
+
+    std::cout << std::endl;
+
     return 0;
 }
 
