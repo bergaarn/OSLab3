@@ -64,6 +64,13 @@ FS::format()
 int
 FS::create(std::string filepath)
 {
+    // Check max length for file name
+    if (filepath.size() >= 56)
+    {
+        //std::cout << "Error: Filename too long (55 characters maximum)" << std::endl;
+        return 1;
+    }
+
     // Check for duplicate file
     uint8_t duplicateBuffer[BLOCK_SIZE]{};
     if (disk.read(ROOT_BLOCK, duplicateBuffer) != 0)
@@ -94,7 +101,6 @@ FS::create(std::string filepath)
         if (line.empty())
         {
             fileDataRead = true;
-            std::cout << "Finished reading file.\n";
         }
         else 
         {
@@ -268,16 +274,17 @@ FS::ls()
     }
 
     // Leave room for filename
-    std::cout << std::left << std::setw(28) << " name" << std::right << " size" << std::endl;
-
+    //std::cout << std::left << std::setw(56) << "name" << std::right << "size" << std::endl;
+    
+    std::cout << "name\t size" << std::endl;
+    
     dir_entry* rootDir_entries = reinterpret_cast<dir_entry*>(rootBuffer);
     for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++)
     {
         if (rootDir_entries[i].file_name[0] != '\0')
         {
             std::cout 
-                << " " << std::left << std::setw(28) 
-                << rootDir_entries[i].file_name << std::right
+                << rootDir_entries[i].file_name << "\t "
                 << rootDir_entries[i].size << std::endl;
         }
     }
