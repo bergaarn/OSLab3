@@ -72,12 +72,12 @@ FS::create(std::string filepath)
     }
 
     // Check for duplicate file
-    uint8_t duplicateBuffer[BLOCK_SIZE];
-    if (disk.read(ROOT_BLOCK, duplicateBuffer) != 0)
+    uint8_t rootBuffer[BLOCK_SIZE];
+    if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
     {
-        return 2;
+        return 8;
     }
-    dir_entry* directory_entries = reinterpret_cast<dir_entry*>(duplicateBuffer);
+    dir_entry* directory_entries = reinterpret_cast<dir_entry*>(rootBuffer);
 
     for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++)
     {
@@ -112,7 +112,6 @@ FS::create(std::string filepath)
     {
         return 4;
     }
-
 
     std::vector<uint16_t> freeBlocks;
     int textLeft = completedText.size();
@@ -182,20 +181,13 @@ FS::create(std::string filepath)
     newFile.type = TYPE_FILE;
     newFile.access_rights = READ | WRITE; // Read | Write Permissions
 
-    uint8_t rootBuffer[BLOCK_SIZE];
-    if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
-    {
-        return 8;
-    }
-
     // Find a free `dir_entry` slot (all zeros)
-    dir_entry* entries = reinterpret_cast<dir_entry*>(rootBuffer);
     bool entryAvailable = false;
     for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); ++i)
     {
-        if (entries[i].file_name[0] == '\0')
+        if (directory_entries[i].file_name[0] == '\0')
         {
-            entries[i] = newFile;
+            directory_entries[i] = newFile;
             entryAvailable = true;
             break;
         }
@@ -246,7 +238,12 @@ FS::cat(std::string filepath)
         return 2;
     }
 
-    uint16_t fileBlock = static_cast<int16_t>(targetFile->first_blk);
+    if (disk.read(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
+    {
+        return 3;
+    }
+
+    int16_t fileBlock = static_cast<int16_t>(targetFile->first_blk);
     int bytesToRead = targetFile->size;
 
     while (fileBlock != FAT_EOF && bytesToRead > 0)
@@ -349,8 +346,6 @@ FS::cp(std::string sourcepath, std::string destpath)
     {
         return 4;
     }
-
-
 
     // Extract file data from sourcefile's blocks
     std::string fileData;
@@ -604,7 +599,195 @@ FS::rm(std::string filepath)
 int
 FS::append(std::string filepath1, std::string filepath2)
 {
-    std::cout << "FS::append(" << filepath1 << "," << filepath2 << ")\n";
+    // Read root directory
+    uint8_t rootBuffer[BLOCK_SIZE];
+    if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
+    {
+        return 1;
+    }
+    dir_entry* directory_entries = reinterpret_cast<dir_entry*>(rootBuffer);
+
+    // Look for source and destination files
+    dir_entry* sourceFile = nullptr;
+    dir_entry* destFile = nullptr;
+    for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++)
+    {
+        if (directory_entries[i].file_name[0] != '\0') 
+        {
+            if (strcmp(directory_entries[i].file_name, filepath1.c_str()) == 0)
+            {
+                sourceFile = &directory_entries[i];
+            }
+    
+            if (strcmp(directory_entries[i].file_name, filepath2.c_str()) == 0)
+            {
+                destFile = &directory_entries[i]; 
+            } 
+        }
+    }
+    if (!sourceFile) 
+    {
+        return 2;
+    }
+    if (!destFile) 
+    {
+        return 3;
+    }
+
+    // Load FAT into memory
+    if (disk.read(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
+    {
+        return 4;
+    }
+
+    // Read entire source file into memory
+    std::string sourceFileData;
+    int16_t currentBlock = static_cast<int16_t>(sourceFile->first_blk);
+    int bytesLeftToRead = sourceFile->size;
+
+    while (currentBlock != FAT_EOF && bytesLeftToRead > 0)
+    {
+        if (currentBlock < 0 || currentBlock >= disk.get_no_blocks())
+        {
+            return 5;
+        }
+
+        uint8_t blockBuffer[BLOCK_SIZE]{};
+        if (disk.read(currentBlock, blockBuffer) != 0)
+        {
+            return 6;
+        }
+
+        int bytesToRead = std::min(bytesLeftToRead, BLOCK_SIZE);
+        sourceFileData.append(reinterpret_cast<char*>(blockBuffer), bytesToRead);
+
+        bytesLeftToRead -= bytesToRead;
+        currentBlock = fat[currentBlock];
+    }
+
+    // Sourcefile is empty, nothing to append
+    if (sourceFileData.empty())
+    {
+        return 0;
+    } 
+
+    std::vector<int16_t> destNewBlocks;
+    int sourceFileBytesLeft = sourceFileData.size();
+    int bytesWritten = 0;
+    int number_of_blocks = disk.get_no_blocks();
+
+    // If destination file is empty
+    if (destFile->first_blk == 0xFFFF)
+    {
+    }
+    else
+    {
+        // Find last block of dest
+        int16_t lastBlock = destFile->first_blk;
+        while (fat[lastBlock] != FAT_EOF)
+        {
+            lastBlock = fat[lastBlock];
+        }
+
+        // See if last block has free space
+        int usedBytes = destFile->size % BLOCK_SIZE;
+        if (usedBytes != 0 && sourceFileBytesLeft > 0)
+        {
+            uint8_t blockBuffer[BLOCK_SIZE];
+            if (disk.read(lastBlock, blockBuffer) != 0)
+            {
+                return 8;
+            }
+
+            int freeSpace = BLOCK_SIZE - usedBytes;
+            int bytesToCopy = std::min(sourceFileBytesLeft, freeSpace);
+
+            memcpy(blockBuffer + usedBytes, sourceFileData.data() + bytesWritten, bytesToCopy);
+
+            if (disk.write(lastBlock, blockBuffer) != 0)
+            {
+                return 8;
+            }
+
+            bytesWritten += bytesToCopy;
+            sourceFileBytesLeft -= bytesToCopy;
+        }
+    }
+
+    // Allocate NEW blocks if there’s still data left
+    while (sourceFileBytesLeft > 0)
+    {
+        int emptyBlock = -1;
+        for (int i = 0; i < number_of_blocks; i++)
+        {
+            if (fat[i] == FAT_FREE)
+            {
+                emptyBlock = i;
+                break;
+            }
+        }
+        // Directory is full, no blocks available
+        if (emptyBlock == -1)
+        {
+            return 7; 
+
+        } 
+        destNewBlocks.push_back(emptyBlock);
+
+        uint8_t buffer[BLOCK_SIZE]{};
+        int bytesToWrite = std::min(sourceFileBytesLeft, BLOCK_SIZE);
+        memcpy(buffer, sourceFileData.data() + bytesWritten, bytesToWrite);
+
+        if (disk.write(emptyBlock, buffer) != 0) 
+        {
+            return 8;
+        }
+
+        bytesWritten += bytesToWrite;
+        sourceFileBytesLeft -= bytesToWrite;
+    }
+
+    // Link new blocks together
+    for (int i = 0; i < destNewBlocks.size(); i++)
+    {
+        if (i + 1 < destNewBlocks.size())
+        {
+            fat[destNewBlocks[i]] = destNewBlocks[i + 1];
+        }
+        else
+        {
+            fat[destNewBlocks[i]] = FAT_EOF;
+        }
+    }
+
+    //  Attach to destination FAT chain
+    if (destFile->first_blk == 0xFFFF) // empty file
+    {
+        destFile->first_blk = destNewBlocks[0];
+    }
+    else if (!destNewBlocks.empty())
+    {
+        int16_t lastBlock = destFile->first_blk;
+        while (fat[lastBlock] != FAT_EOF)
+        {
+            lastBlock = fat[lastBlock];
+        }
+        fat[lastBlock] = destNewBlocks[0];
+    }
+
+    // Update size
+    destFile->size += sourceFileData.size();
+
+    // Write FAT and root back to disk
+    if (disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0) 
+    {
+        return 9;
+    }
+    if (disk.write(ROOT_BLOCK, rootBuffer) != 0) 
+    {
+        return 10;
+    }
+
     return 0;
 }
 
