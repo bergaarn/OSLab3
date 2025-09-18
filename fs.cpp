@@ -72,7 +72,7 @@ FS::create(std::string filepath)
     }
 
     // Check for duplicate file
-    uint8_t duplicateBuffer[BLOCK_SIZE]{};
+    uint8_t duplicateBuffer[BLOCK_SIZE];
     if (disk.read(ROOT_BLOCK, duplicateBuffer) != 0)
     {
         return 2;
@@ -108,6 +108,12 @@ FS::create(std::string filepath)
         }
     }
 
+    if (disk.read(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
+    {
+        return 4;
+    }
+
+
     std::vector<uint16_t> freeBlocks;
     int textLeft = completedText.size();
     int textWritten = 0;
@@ -129,7 +135,7 @@ FS::create(std::string filepath)
         // Return if no blocks are free
         if (freeBlock == -1)
         {
-            return 4;
+            return 5;
         }
 
         // Add free block to file's allocated blocks
@@ -143,7 +149,7 @@ FS::create(std::string filepath)
         // Return if failed to write to the free block
         if (disk.write(freeBlock, textBuffer) != 0)
         {
-            return 5;
+            return 6;
         }
 
         // Update amount of text left to write to blocks
@@ -165,21 +171,21 @@ FS::create(std::string filepath)
 
     if (disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0) // Update FAT in disk
     {
-        return 6;
+        return 7;
     } 
     dir_entry newFile{};    // Initialize struct to 0
     strncpy(newFile.file_name, filepath.c_str(), sizeof(newFile.file_name) - 1);    // Copy filepath to struct
     
     newFile.file_name[sizeof(newFile.file_name) - 1] = '\0';
     newFile.size = completedText.size();    // Set size of the contents of the file to the new file
-    newFile.first_blk = freeBlocks.empty() ? 0: freeBlocks[0];
+    newFile.first_blk = freeBlocks.empty() ? 0xFFFF: freeBlocks[0];
     newFile.type = TYPE_FILE;
     newFile.access_rights = READ | WRITE; // Read | Write Permissions
 
     uint8_t rootBuffer[BLOCK_SIZE];
     if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
     {
-        return 7;
+        return 8;
     }
 
     // Find a free `dir_entry` slot (all zeros)
@@ -198,13 +204,13 @@ FS::create(std::string filepath)
     // root directory full
     if (!entryAvailable)
     {
-        return 8;
+        return 9;
     }
 
     // Write back root block
     if (disk.write(ROOT_BLOCK, rootBuffer) != 0)
     {
-        return 9;
+        return 10;
     }
 
     return 0;
@@ -214,7 +220,7 @@ FS::create(std::string filepath)
 int
 FS::cat(std::string filepath)
 {
-    uint8_t rootBuffer[BLOCK_SIZE]{};
+    uint8_t rootBuffer[BLOCK_SIZE];
     if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
     {
         return 1;
@@ -240,12 +246,12 @@ FS::cat(std::string filepath)
         return 2;
     }
 
-    uint16_t fileBlock = targetFile->first_blk;
+    uint16_t fileBlock = static_cast<int16_t>(targetFile->first_blk);
     int bytesToRead = targetFile->size;
 
     while (fileBlock != FAT_EOF && bytesToRead > 0)
     {
-        uint8_t blockBuffer[BLOCK_SIZE]{};
+        uint8_t blockBuffer[BLOCK_SIZE];
         if (disk.read(fileBlock, blockBuffer) != 0)
         {
             return 3;
@@ -267,7 +273,7 @@ FS::cat(std::string filepath)
 int
 FS::ls()
 {
-    uint8_t rootBuffer[BLOCK_SIZE]{};
+    uint8_t rootBuffer[BLOCK_SIZE];
     if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
     {
         return 1;
@@ -300,7 +306,7 @@ int
 FS::cp(std::string sourcepath, std::string destpath)
 {
     // Read in the root directory
-    uint8_t rootBuffer[BLOCK_SIZE]{};
+    uint8_t rootBuffer[BLOCK_SIZE];
     if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
     {
         return 1;
@@ -339,17 +345,24 @@ FS::cp(std::string sourcepath, std::string destpath)
         return 3;
     }
 
+    if (disk.read(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) !=0)
+    {
+        return 4;
+    }
+
+
+
     // Extract file data from sourcefile's blocks
     std::string fileData;
-    uint16_t block = sourceFile->first_blk;
+    int16_t block = static_cast<int16_t>(sourceFile->first_blk);
     int bytesToRead = sourceFile->size;
 
     while (block != FAT_EOF && bytesToRead > 0)
     {
-        uint8_t blockBuffer[BLOCK_SIZE]{};
+        uint8_t blockBuffer[BLOCK_SIZE];
         if (disk.read(block, blockBuffer) != 0)
         {
-            return 4;
+            return 5;
         }
 
         int bytesToWrite = std::min(bytesToRead, BLOCK_SIZE);
@@ -380,7 +393,7 @@ FS::cp(std::string sourcepath, std::string destpath)
         // Return if no free blocks are avaiable (Directory is full)
         if (freeBlock == -1)
         {
-            return 5;
+            return 6;
         }
 
         freeBlocks.push_back(freeBlock);
@@ -391,7 +404,7 @@ FS::cp(std::string sourcepath, std::string destpath)
 
         if (disk.write(freeBlock, blockBuffer) != 0)
         {
-            return 6;
+            return 7;
         }
 
         bytesWritten += bytesToWrite;
@@ -412,7 +425,7 @@ FS::cp(std::string sourcepath, std::string destpath)
     }
     if (disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
     {
-        return 7;
+        return 8;
     }
 
     // Create a new entry in the root directory for the file
@@ -420,7 +433,7 @@ FS::cp(std::string sourcepath, std::string destpath)
     strncpy(newFile.file_name, destpath.c_str(), sizeof(newFile.file_name) - 1);
     newFile.file_name[sizeof(newFile.file_name) - 1] = '\0';  // Add null terminator to end of filename
     newFile.size = fileData.size(); // Assign data size to new file entry from string
-    newFile.first_blk = freeBlocks.empty() ? 0 : freeBlocks[0]; // Fail safe if the file has no data in it
+    newFile.first_blk = freeBlocks.empty() ? 0xFFFF : freeBlocks[0]; // Fail safe if the file has no data in it
     newFile.type = TYPE_FILE;
     newFile.access_rights = READ | WRITE;
 
@@ -439,12 +452,12 @@ FS::cp(std::string sourcepath, std::string destpath)
     // Root directory is full
     if (!entryAvailable)
     {
-        return 8; // no free root entry
+        return 9; // no free root entry
     }
         
     if (disk.write(ROOT_BLOCK, rootBuffer) != 0)
     {
-        return 9; 
+        return 10; 
     }
 
     return 0;
@@ -455,6 +468,10 @@ FS::cp(std::string sourcepath, std::string destpath)
 int
 FS::mv(std::string sourcepath, std::string destpath)
 {
+    if (sourcepath == destpath)
+    {
+        return 0;
+    }
 
     // Check max length for file name
     if (destpath.size() >= 56)
@@ -464,7 +481,7 @@ FS::mv(std::string sourcepath, std::string destpath)
     }
 
     // Read in the root directory
-    uint8_t rootBuffer[BLOCK_SIZE]{};
+    uint8_t rootBuffer[BLOCK_SIZE];
     if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
     {
         return 2;
@@ -491,6 +508,11 @@ FS::mv(std::string sourcepath, std::string destpath)
                 // If so return
                 destpathAlreadyExists = true;
             }
+
+            if (sourceFile && destpathAlreadyExists)
+            {
+                break;
+            }
         }
     }
     if (!sourceFile)
@@ -504,7 +526,7 @@ FS::mv(std::string sourcepath, std::string destpath)
         return 3;
     }
 
-    strncpy(sourceFile->file_name,destpath.c_str(), sizeof(sourceFile->file_name - 1));
+    strncpy(sourceFile->file_name, destpath.c_str(), sizeof(sourceFile->file_name) - 1);
     sourceFile->file_name[sizeof(sourceFile->file_name) - 1] = '\0';
 
     if (disk.write(ROOT_BLOCK, rootBuffer) != 0)
@@ -519,7 +541,61 @@ FS::mv(std::string sourcepath, std::string destpath)
 int
 FS::rm(std::string filepath)
 {
-    std::cout << "FS::rm(" << filepath << ")\n";
+    uint8_t rootBuffer[BLOCK_SIZE];
+    if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
+    {
+        return 1;
+    }
+    
+    dir_entry* dir_entries = reinterpret_cast<dir_entry*>(rootBuffer);
+    dir_entry* entryToRemove = nullptr;
+    int number_of_entries = BLOCK_SIZE / sizeof(dir_entry);
+   
+ 
+    for (int i = 0; i < number_of_entries; i++) 
+    {
+        if (dir_entries[i].file_name[0] != '\0')
+        {
+            if (strcmp(dir_entries[i].file_name, filepath.c_str()) == 0)
+            {
+                entryToRemove = &dir_entries[i];
+                break;
+            }
+        }
+    }
+    if (!entryToRemove)
+    {
+        //std::cout << "ERROR: File not found" << std::endl;
+        return 2;
+    }
+   
+    if (disk.read(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
+    {
+        return 3;
+    }
+
+    int16_t currentBlock = static_cast<int16_t>(entryToRemove->first_blk);
+ 
+    // Traverse the FAT chain while freeing all blocks allocated for the entry
+    while (currentBlock != FAT_EOF)
+    {
+        int16_t nextBlock = fat[currentBlock];
+        fat[currentBlock] = FAT_FREE;
+        currentBlock = nextBlock;
+    }
+
+    memset(entryToRemove, 0, sizeof(dir_entry));
+
+    if (disk.write(ROOT_BLOCK, rootBuffer) != 0)
+    {
+        return 4;
+    }
+    
+    if (disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
+    {
+        return 5;
+    }
+
     return 0;
 }
 
