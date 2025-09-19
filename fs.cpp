@@ -806,11 +806,12 @@ FS::mkdir(std::string dirpath)
     }
 
     uint8_t parentBuffer[BLOCK_SIZE];
-    if (disk.read(ROOT_BLOCK, parentBuffer) != 0)
+    if (disk.read(currentDirectory, parentBuffer) != 0)
     {
         return 2;
     }
 
+    uint16_t parentBlock = currentDirectory;
     // Check if dirname already exists in the parent directory
     dir_entry* parentDir_entries = reinterpret_cast<dir_entry*>(parentBuffer);
     int number_of_entries = BLOCK_SIZE / sizeof(dir_entry);
@@ -869,7 +870,7 @@ FS::mkdir(std::string dirpath)
     strncpy(parentEntry.file_name, "..", sizeof(parentEntry.file_name) - 1);
     parentEntry.file_name[sizeof(parentEntry.file_name) - 1] = '\0';
     parentEntry.type = TYPE_DIR;
-    parentEntry.first_blk = ROOT_BLOCK;
+    parentEntry.first_blk = currentDirectory;
     parentEntry.size = 0;
     parentEntry.access_rights = READ | WRITE | EXECUTE;
     subDir_entries[0] = parentEntry;
@@ -901,7 +902,7 @@ FS::mkdir(std::string dirpath)
         }
     }
 
-    if (disk.write(ROOT_BLOCK, parentBuffer) != 0)
+    if (disk.write(currentDirectory, parentBuffer) != 0)
     {
         return 9;
     }
@@ -916,6 +917,11 @@ FS::cd(std::string dirpath)
     // Move to parent directory from a sub directory
     if (dirpath == "..")
     {
+        if (currentDirectory == ROOT_BLOCK)
+        {
+            return 0;
+        }
+
         uint8_t parentBuffer[BLOCK_SIZE];
         if (disk.read(currentDirectory, parentBuffer) != 0)
         {
@@ -925,6 +931,7 @@ FS::cd(std::string dirpath)
         dir_entry* parentDir_entries = reinterpret_cast<dir_entry*>(parentBuffer);
         currentDirectory = parentDir_entries[0].first_blk;
 
+        std::cout << "Going up to parent directory " << currentDirectory << std::endl;
         return 0; // Return succesfully
     }
 
@@ -966,7 +973,65 @@ FS::cd(std::string dirpath)
 int
 FS::pwd()
 {
-    std::cout << "FS::pwd()\n";
+
+    if (currentDirectory == ROOT_BLOCK)
+    {
+        std::cout << "/" << std::endl;
+        return 0;
+    }
+
+    std::vector<std::string>filePath;
+    uint16_t currentBlock = currentDirectory;
+
+    while (currentBlock != ROOT_BLOCK)
+    {
+        uint8_t currentBuffer[BLOCK_SIZE];
+        if (disk.read(currentBlock, currentBuffer) != 0)
+        {
+            return 1;
+        }
+        dir_entry* current_entries = reinterpret_cast<dir_entry*>(currentBuffer);
+
+        uint16_t parentBlock = current_entries[0].first_blk;
+        uint8_t parentBuffer[BLOCK_SIZE];
+        if (disk.read(parentBlock, parentBuffer) != 0)
+        {
+            return 2;
+        }
+
+        dir_entry* parent_entries = reinterpret_cast<dir_entry*>(parentBuffer);
+
+        std::string currentPath = "";
+        for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++)
+        {
+            if (parent_entries[i].file_name[0] != '\0')
+            {
+                if (parent_entries[i].first_blk == currentBlock)
+                {
+                    if (parent_entries[i].type == TYPE_DIR)
+                    {
+                        currentPath = parent_entries[i].file_name;
+                        break;
+                    }
+                }
+            }
+        }
+
+        filePath.push_back(currentPath);
+        currentBlock = parentBlock;
+    }
+
+    std::cout << "/";
+    for (int i = filePath.size() - 1; i >= 0; i--)
+    {
+        std::cout << filePath[i];
+        if (i != 0)
+        {
+            std::cout << "/";
+        }
+    }
+    std::cout << std::endl;
+
     return 0;
 }
 
