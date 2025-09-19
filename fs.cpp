@@ -72,12 +72,12 @@ FS::create(std::string filepath)
     }
 
     // Check for duplicate file
-    uint8_t rootBuffer[BLOCK_SIZE];
-    if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
+    uint8_t dirBuffer[BLOCK_SIZE];
+    if (disk.read(currentDirectory, dirBuffer) != 0)
     {
         return 8;
     }
-    dir_entry* directory_entries = reinterpret_cast<dir_entry*>(rootBuffer);
+    dir_entry* directory_entries = reinterpret_cast<dir_entry*>(dirBuffer);
 
     for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++)
     {
@@ -199,7 +199,7 @@ FS::create(std::string filepath)
     }
 
     // Write back root block
-    if (disk.write(ROOT_BLOCK, rootBuffer) != 0)
+    if (disk.write(currentDirectory, dirBuffer) != 0)
     {
         return 10;
     }
@@ -211,13 +211,13 @@ FS::create(std::string filepath)
 int
 FS::cat(std::string filepath)
 {
-    uint8_t rootBuffer[BLOCK_SIZE];
-    if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
+    uint8_t dirBuffer[BLOCK_SIZE];
+    if (disk.read(currentDirectory, dirBuffer) != 0)
     {
         return 1;
     }
 
-    dir_entry* directory_entries = reinterpret_cast<dir_entry*>(rootBuffer);
+    dir_entry* directory_entries = reinterpret_cast<dir_entry*>(dirBuffer);
     dir_entry* targetFile = nullptr;
 
     for (int i = 0; i < BLOCK_SIZE /sizeof(dir_entry); i++)
@@ -269,29 +269,45 @@ FS::cat(std::string filepath)
 int
 FS::ls()
 {
-    uint8_t rootBuffer[BLOCK_SIZE];
-    if (disk.read(currentDirectory, rootBuffer) != 0)
+    uint8_t dirBuffer[BLOCK_SIZE];
+    if (disk.read(currentDirectory, dirBuffer) != 0)
     {
         return 1;
     }
 
     // Leave room for filename
     std::cout << std::left << std::setw(56) << "name" << std::right << "type\t size" << std::endl;
-    
-   
     std::string type = "";
-    dir_entry* rootDir_entries = reinterpret_cast<dir_entry*>(rootBuffer);
+    std::string size = "-";
+    dir_entry* dir_entries = reinterpret_cast<dir_entry*>(dirBuffer);
     for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++)
     {
-        if (rootDir_entries[i].file_name[0] != '\0')
+        if (dir_entries[i].file_name[0] == '\0')
         {
-            type = (rootDir_entries[i].type == TYPE_FILE) ? "file" : "dir";
-
-            std::cout << std::left << std::setw(56)
-                << rootDir_entries[i].file_name << std::right
-                << type << "\t "
-                << rootDir_entries[i].size << std::endl;
+            continue;
         }
+
+        if (currentDirectory != ROOT_BLOCK && i == 0)
+        {
+            continue;
+        }
+
+        type = (dir_entries[i].type == TYPE_FILE) ? "file" : "dir";
+        if (type == "dir")
+        {
+            std::cout << std::left << std::setw(56)
+            << dir_entries[i].file_name << std::right
+            << type << "\t "
+            << size << std::endl;
+        } 
+        else
+        {
+            std::cout << std::left << std::setw(56)
+            << dir_entries[i].file_name << std::right
+            << type << "\t "
+            << dir_entries[i].size << std::endl;
+        }
+        
     }
 
     std::cout << std::endl;
@@ -305,29 +321,29 @@ int
 FS::cp(std::string sourcepath, std::string destpath)
 {
     // Read in the root directory
-    uint8_t rootBuffer[BLOCK_SIZE];
-    if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
+    uint8_t dirBuffer[BLOCK_SIZE];
+    if (disk.read(currentDirectory, dirBuffer) != 0)
     {
         return 1;
     }
 
-    dir_entry* rootDir_entries = reinterpret_cast<dir_entry*>(rootBuffer);
-    int number_of_entries = BLOCK_SIZE / sizeof(dir_entry);
+    dir_entry* dir_entries = reinterpret_cast<dir_entry*>(dirBuffer);
     dir_entry* sourceFile = nullptr;
     bool destpathAlreadyExists = false;
-    
+
+    int number_of_entries = BLOCK_SIZE / sizeof(dir_entry); 
     for (int i = 0; i < number_of_entries; i++)
     {
-        if (rootDir_entries[i].file_name[0] != '\0')
+        if (dir_entries[i].file_name[0] != '\0')
         {
             // Find the <sourcepath> in directory
-            if(strcmp(rootDir_entries[i].file_name, sourcepath.c_str()) == 0)
+            if(strcmp(dir_entries[i].file_name, sourcepath.c_str()) == 0)
             {
-                sourceFile = &rootDir_entries[i];
+                sourceFile = &dir_entries[i];
             }
 
             // Check if <destpath> already exists in directory
-            if (strcmp(rootDir_entries[i].file_name, destpath.c_str()) == 0)
+            if (strcmp(dir_entries[i].file_name, destpath.c_str()) == 0)
             {
                 // If so return
                 destpathAlreadyExists = true;
@@ -438,9 +454,9 @@ FS::cp(std::string sourcepath, std::string destpath)
     bool entryAvailable = false;
     for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); ++i)
     {
-        if (rootDir_entries[i].file_name[0] == '\0')
+        if (dir_entries[i].file_name[0] == '\0')
         {
-            rootDir_entries[i] = newFile;
+            dir_entries[i] = newFile;
             entryAvailable = true;
             break;
         }
@@ -452,7 +468,7 @@ FS::cp(std::string sourcepath, std::string destpath)
         return 9; // no free root entry
     }
         
-    if (disk.write(ROOT_BLOCK, rootBuffer) != 0)
+    if (disk.write(currentDirectory, dirBuffer) != 0)
     {
         return 10; 
     }
@@ -478,29 +494,29 @@ FS::mv(std::string sourcepath, std::string destpath)
     }
 
     // Read in the root directory
-    uint8_t rootBuffer[BLOCK_SIZE];
-    if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
+    uint8_t dirBuffer[BLOCK_SIZE];
+    if (disk.read(currentDirectory, dirBuffer) != 0)
     {
         return 2;
     }
 
-    dir_entry* rootDir_entries = reinterpret_cast<dir_entry*>(rootBuffer);
+    dir_entry* dir_entries = reinterpret_cast<dir_entry*>(dirBuffer);
     int number_of_entries = BLOCK_SIZE / sizeof(dir_entry);
     dir_entry* sourceFile = nullptr;
     bool destpathAlreadyExists = false;
     
     for (int i = 0; i < number_of_entries; i++)
     {
-        if (rootDir_entries[i].file_name[0] != '\0')
+        if (dir_entries[i].file_name[0] != '\0')
         {
             // Find the <sourcepath> in directory
-            if (strcmp(rootDir_entries[i].file_name, sourcepath.c_str()) == 0)
+            if (strcmp(dir_entries[i].file_name, sourcepath.c_str()) == 0)
             {
-                sourceFile = &rootDir_entries[i];
+                sourceFile = &dir_entries[i];
             }
 
             // Check if <destpath> already exists in directory
-            if (strcmp(rootDir_entries[i].file_name, destpath.c_str()) == 0)
+            if (strcmp(dir_entries[i].file_name, destpath.c_str()) == 0)
             {
                 // If so return
                 destpathAlreadyExists = true;
@@ -526,7 +542,7 @@ FS::mv(std::string sourcepath, std::string destpath)
     strncpy(sourceFile->file_name, destpath.c_str(), sizeof(sourceFile->file_name) - 1);
     sourceFile->file_name[sizeof(sourceFile->file_name) - 1] = '\0';
 
-    if (disk.write(ROOT_BLOCK, rootBuffer) != 0)
+    if (disk.write(currentDirectory, dirBuffer) != 0)
     {
         return 4;        
     }
@@ -538,17 +554,16 @@ FS::mv(std::string sourcepath, std::string destpath)
 int
 FS::rm(std::string filepath)
 {
-    uint8_t rootBuffer[BLOCK_SIZE];
-    if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
+    uint8_t dirBuffer[BLOCK_SIZE];
+    if (disk.read(currentDirectory, dirBuffer) != 0)
     {
         return 1;
     }
     
-    dir_entry* dir_entries = reinterpret_cast<dir_entry*>(rootBuffer);
+    dir_entry* dir_entries = reinterpret_cast<dir_entry*>(dirBuffer);
     dir_entry* entryToRemove = nullptr;
+
     int number_of_entries = BLOCK_SIZE / sizeof(dir_entry);
-   
- 
     for (int i = 0; i < number_of_entries; i++) 
     {
         if (dir_entries[i].file_name[0] != '\0')
@@ -583,7 +598,7 @@ FS::rm(std::string filepath)
 
     memset(entryToRemove, 0, sizeof(dir_entry));
 
-    if (disk.write(ROOT_BLOCK, rootBuffer) != 0)
+    if (disk.write(currentDirectory, dirBuffer) != 0)
     {
         return 4;
     }
