@@ -174,7 +174,6 @@ FS::create(std::string filepath)
     } 
     dir_entry newFile{};    // Initialize struct to 0
     strncpy(newFile.file_name, filepath.c_str(), sizeof(newFile.file_name) - 1);    // Copy filepath to struct
-    
     newFile.file_name[sizeof(newFile.file_name) - 1] = '\0';
     newFile.size = completedText.size();    // Set size of the contents of the file to the new file
     newFile.first_blk = freeBlocks.empty() ? 0xFFFF: freeBlocks[0];
@@ -271,23 +270,26 @@ int
 FS::ls()
 {
     uint8_t rootBuffer[BLOCK_SIZE];
-    if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
+    if (disk.read(currentDirectory, rootBuffer) != 0)
     {
         return 1;
     }
 
     // Leave room for filename
-    //std::cout << std::left << std::setw(56) << "name" << std::right << "size" << std::endl;
+    std::cout << std::left << std::setw(56) << "name" << std::right << "type\t size" << std::endl;
     
-    std::cout << "name\t size" << std::endl;
-    
+   
+    std::string type = "";
     dir_entry* rootDir_entries = reinterpret_cast<dir_entry*>(rootBuffer);
     for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++)
     {
         if (rootDir_entries[i].file_name[0] != '\0')
         {
-            std::cout 
-                << rootDir_entries[i].file_name << "\t "
+            type = (rootDir_entries[i].type == TYPE_FILE) ? "file" : "dir";
+
+            std::cout << std::left << std::setw(56)
+                << rootDir_entries[i].file_name << std::right
+                << type << "\t "
                 << rootDir_entries[i].size << std::endl;
         }
     }
@@ -796,7 +798,114 @@ FS::append(std::string filepath1, std::string filepath2)
 int
 FS::mkdir(std::string dirpath)
 {
-    std::cout << "FS::mkdir(" << dirpath << ")\n";
+     // Check max length for file name
+    if (dirpath.size() >= 56)
+    {
+        //std::cout << "Error: Filename too long (55 characters maximum)" << std::endl;
+        return 1;
+    }
+
+    uint8_t parentBuffer[BLOCK_SIZE];
+    if (disk.read(ROOT_BLOCK, parentBuffer) != 0)
+    {
+        return 2;
+    }
+
+    // Check if dirname already exists in the parent directory
+    dir_entry* parentDir_entries = reinterpret_cast<dir_entry*>(parentBuffer);
+    int number_of_entries = BLOCK_SIZE / sizeof(dir_entry);
+    for (int i = 0; i < number_of_entries; i++)
+    {
+        if (parentDir_entries[i].file_name[0] != '\0')
+        {
+            if (strcmp(parentDir_entries[i].file_name, dirpath.c_str()) == 0)
+            {
+                std::cout << "ERROR: \"" << dirpath << "\" directory name already exists." << std::endl;
+                return 3;
+            }
+        }
+    }
+
+    // Check if parent has room
+    bool roomInParent = false;
+    for (int i = 0; i < number_of_entries; i++)
+    {
+        if (parentDir_entries[i].file_name[0] == '\0')
+        {
+            roomInParent = true;
+            break;
+        }
+    }
+    if (!roomInParent)
+    {
+        return 4;
+    }
+
+    if (disk.read(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
+    {
+        return 5;
+    }
+
+    // Find free block for subdir 
+    int freeBlock = -1;
+    for (int i = 2; i < disk.get_no_blocks(); i++)
+    {
+        if (fat[i] == FAT_FREE)
+        {
+            freeBlock = i;
+            break;
+        }
+    }
+    if (freeBlock == -1)
+    {
+        return 6;
+    }
+    fat[freeBlock] = FAT_EOF;
+
+    uint8_t subDirBuffer[BLOCK_SIZE]{};
+    dir_entry* subDir_entries = reinterpret_cast<dir_entry*>(subDirBuffer);
+
+    dir_entry parentEntry{};
+    strncpy(parentEntry.file_name, "..", sizeof(parentEntry.file_name) - 1);
+    parentEntry.file_name[sizeof(parentEntry.file_name) - 1] = '\0';
+    parentEntry.type = TYPE_DIR;
+    parentEntry.first_blk = ROOT_BLOCK;
+    parentEntry.size = 0;
+    parentEntry.access_rights = READ | WRITE | EXECUTE;
+    subDir_entries[0] = parentEntry;
+
+    if (disk.write(freeBlock, subDirBuffer) != 0)
+    {
+        return 7;
+    }
+
+    if (disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
+    {
+        return 8;
+    }
+
+    dir_entry subDirEntry{};
+    strncpy(subDirEntry.file_name, dirpath.c_str(), sizeof(subDirEntry.file_name) - 1);
+    subDirEntry.file_name[sizeof(subDirEntry.file_name) - 1] = '\0';
+    subDirEntry.type = TYPE_DIR;
+    subDirEntry.first_blk = freeBlock;
+    subDirEntry.size = 0;
+    subDirEntry.access_rights = READ | WRITE | EXECUTE;
+
+    for (int i = 0; i < number_of_entries; i++)
+    {
+        if (parentDir_entries[i].file_name[0] == '\0')
+        {
+            parentDir_entries[i] = subDirEntry;
+            break;
+        }
+    }
+
+    if (disk.write(ROOT_BLOCK, parentBuffer) != 0)
+    {
+        return 9;
+    }
+
     return 0;
 }
 
@@ -804,7 +913,51 @@ FS::mkdir(std::string dirpath)
 int
 FS::cd(std::string dirpath)
 {
-    std::cout << "FS::cd(" << dirpath << ")\n";
+    // Move to parent directory from a sub directory
+    if (dirpath == "..")
+    {
+        uint8_t parentBuffer[BLOCK_SIZE];
+        if (disk.read(currentDirectory, parentBuffer) != 0)
+        {
+            return 1;
+        }
+
+        dir_entry* parentDir_entries = reinterpret_cast<dir_entry*>(parentBuffer);
+        currentDirectory = parentDir_entries[0].first_blk;
+
+        return 0; // Return succesfully
+    }
+
+    uint8_t subDirBuffer[BLOCK_SIZE];
+    if (disk.read(currentDirectory, subDirBuffer) != 0)
+    {
+        return 2;
+    }
+
+    dir_entry* subDir_entries = reinterpret_cast<dir_entry*>(subDirBuffer);
+    int number_of_entries = BLOCK_SIZE / sizeof(dir_entry);
+    bool directoryFound = false;
+    for (int i = 0; i < number_of_entries; i++)
+    {
+        if (subDir_entries[i].file_name[0] != '\0')
+        {
+            if (strcmp(subDir_entries[i].file_name, dirpath.c_str()) == 0)
+            {
+                if (subDir_entries[i].type == TYPE_DIR)
+                {
+                    currentDirectory = subDir_entries[i].first_blk;
+                    directoryFound = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!directoryFound)
+    {
+        return 3;
+    }
+        
     return 0;
 }
 
