@@ -82,6 +82,15 @@ FS::resolvePath(const std::string& path, bool mustBeDir, uint16_t& outBlock) {
         bool found = false;
         for (int j = 0; j < BLOCK_SIZE / sizeof(dir_entry); j++) {
             if (strcmp(entries[j].file_name, part.c_str()) == 0) {
+
+                // check execute rights when stepping into a directory
+                if (entries[j].type == TYPE_DIR) {
+                    if (!(entries[j].access_rights & EXECUTE)) {
+                        std::cout << "ERROR: no EXECUTE rights on directory " << entries[j].file_name << "\n";
+                        return -5;
+                    }
+                }
+
                 // If it's the last token, maybe check mustBeDir
                 if (i == tokens.size() - 1) {
                     if (mustBeDir && entries[j].type != TYPE_DIR) return -2;
@@ -128,6 +137,7 @@ FS::format()
     rootEntries[0].first_blk = ROOT_BLOCK;  // root points to itself
     rootEntries[0].type = TYPE_DIR;
     rootEntries[0].size = 0;
+    rootEntries[0].access_rights = READ | WRITE | EXECUTE;  // rwx for root
 
     // Write root block
     if (disk.write(ROOT_BLOCK, rootBuf) != 0)
@@ -170,6 +180,28 @@ FS::create(std::string filepath)
     if (disk.read(parentBlock, dirBuffer) != 0)
         return 3;
     dir_entry* directory_entries = reinterpret_cast<dir_entry*>(dirBuffer);
+
+    // 3b. Check WRITE permission on parent directory
+    if (parentBlock != ROOT_BLOCK) {
+        uint16_t grandParentBlock = directory_entries[0].first_blk; // ".."
+        uint8_t gpBuf[BLOCK_SIZE];
+        if (disk.read(grandParentBlock, gpBuf) != 0)
+            return 11;
+
+        dir_entry* gpEntries = reinterpret_cast<dir_entry*>(gpBuf);
+        dir_entry* parentEntry = nullptr;
+        int numEntries = BLOCK_SIZE / sizeof(dir_entry);
+        for (int i = 0; i < numEntries; i++) {
+            if (gpEntries[i].first_blk == parentBlock) {
+                parentEntry = &gpEntries[i];
+                break;
+            }
+        }
+        if (parentEntry && !(parentEntry->access_rights & WRITE)) {
+            std::cout << "No WRITE rights on parent directory" << std::endl;
+            return -9;
+        }
+    }
 
     // 4. Check for duplicate
     for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) {
@@ -283,6 +315,11 @@ FS::cat(std::string filepath)
     }
     if (!targetFile) return 2;
     if (targetFile->type == TYPE_DIR) return 3;
+    if (!(targetFile->access_rights & READ))
+    {
+        std::cout << "ERROR: no read permission\n";
+        return -6;
+    }
 
     // --- Load FAT ---
     if (disk.read(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
@@ -308,6 +345,15 @@ FS::cat(std::string filepath)
     return 0;
 }
 
+// Helper function for printing access rights
+std::string FS::rightsToString(uint8_t rights) {
+    std::string s = "";
+    s += (rights & READ)    ? "r" : "-";
+    s += (rights & WRITE)   ? "w" : "-";
+    s += (rights & EXECUTE) ? "x" : "-";
+    return s;
+}
+
 // ls lists the content in the currect directory (files and sub-directories)
 int
 FS::ls()
@@ -318,16 +364,9 @@ FS::ls()
         return 1;
     }
 
-    // Leave room for filename
-    std::cout 
-    //<< std::left << std::setw(56) 
-    << "name" 
-    //<< std::right 
-    << "\t type\t size" << std::endl;
-    
+    std::cout << "name\t type\t accessrights\t size" << std::endl;
     std::string type = "";
-    std::string size = "-";
-    
+
     dir_entry* dir_entries = reinterpret_cast<dir_entry*>(dirBuffer);
     for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++)
     {
@@ -342,27 +381,14 @@ FS::ls()
         }
 
         type = (dir_entries[i].type == TYPE_FILE) ? "file" : "dir";
-        if (type == "dir")
-        {
-            std::cout 
-            //<< std::left << std::setw(56)
-            << dir_entries[i].file_name 
-            //<< std::right
-            << "\t " << type << "\t "
-            << size << std::endl;
-        } 
-        else
-        {
-            std::cout
-            //<< std::left << std::setw(56)
-            << dir_entries[i].file_name 
-            //<< std::right
-            << "\t " << type << "\t "
-            << dir_entries[i].size << std::endl;
-        }
-        
+       
+        std::cout 
+        << dir_entries[i].file_name 
+        << "\t " << type 
+        << "\t " << rightsToString(dir_entries[i].access_rights)
+        << "\t\t " << ((type == "dir") ? "-" : std::to_string(dir_entries[i].size))
+        << std::endl; 
     }
-    //std::cout << std::endl;
 
     return 0;
 }
@@ -397,6 +423,12 @@ FS::cp(std::string sourcepath, std::string destpath)
     }
     if (!srcFile || srcFile->type != TYPE_FILE)
         return 3; // source not found or is a dir
+
+     // --- Access rights: must be READable ---
+    if (!(srcFile->access_rights & READ)) {
+        std::cout << "ERROR: no READ permission on " << srcFile->file_name << "\n";
+        return -6;
+    }
 
     // --- Handle destination ---
     std::string dstParent, dstName;
@@ -640,9 +672,32 @@ FS::rm(std::string filepath)
         return 2;
 
     dir_entry* dir_entries = reinterpret_cast<dir_entry*>(dirBuffer);
-    dir_entry* entryToRemove = nullptr;
     int number_of_entries = BLOCK_SIZE / sizeof(dir_entry);
 
+    // --- 3b. Check WRITE permission on parent directory ---
+    if (parentBlock != ROOT_BLOCK) { 
+        // Follow ".." to grandparent
+        uint16_t grandParentBlock = dir_entries[0].first_blk;
+        uint8_t gpBuf[BLOCK_SIZE];
+        if (disk.read(grandParentBlock, gpBuf) != 0)
+            return 12;
+
+        dir_entry* gpEntries = reinterpret_cast<dir_entry*>(gpBuf);
+        dir_entry* parentEntry = nullptr;
+        for (int i = 0; i < number_of_entries; i++) {
+            if (gpEntries[i].first_blk == parentBlock) {
+                parentEntry = &gpEntries[i];
+                break;
+            }
+        }
+        if (parentEntry && !(parentEntry->access_rights & WRITE)) {
+            std::cout << "No WRITE rights on parent directory" << std::endl;
+            return -9;
+        }
+    }
+
+    // --- 4. Find entry to remove ---
+    dir_entry* entryToRemove = nullptr;
     for (int i = 0; i < number_of_entries; i++) {
         if (dir_entries[i].file_name[0] != '\0' &&
             strcmp(dir_entries[i].file_name, name.c_str()) == 0) {
@@ -652,7 +707,13 @@ FS::rm(std::string filepath)
     }
     if (!entryToRemove) return 3; // not found
 
-    // --- 4. Handle directory case ---
+    // Check WRITE rights on target itself
+    if (!(entryToRemove->access_rights & WRITE)) {
+        std::cout << "No WRITE rights on target file/dir" << std::endl;
+        return -10;
+    }
+
+    // --- 5. Handle directory case ---
     if (entryToRemove->type == TYPE_DIR) {
         uint8_t subDirBuffer[BLOCK_SIZE];
         if (disk.read(entryToRemove->first_blk, subDirBuffer) != 0)
@@ -674,13 +735,12 @@ FS::rm(std::string filepath)
         }
     }
 
-    // --- 5. Free blocks in FAT ---
+    // --- 6. Free blocks in FAT ---
     if (disk.read(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
         return 6;
 
     int16_t currentBlock = static_cast<int16_t>(entryToRemove->first_blk);
-
-    if (currentBlock != 0xFFFF) { // <- guard for empty file
+    if (currentBlock != 0xFFFF) { // guard for empty file
         while (currentBlock != FAT_EOF) {
             int16_t nextBlock = fat[currentBlock];
             fat[currentBlock] = FAT_FREE;
@@ -688,12 +748,11 @@ FS::rm(std::string filepath)
         }
     }
 
-    // --- 6. Clear directory entry ---
+    // --- 7. Clear directory entry ---
     memset(entryToRemove, 0, sizeof(dir_entry));
 
     if (disk.write(parentBlock, dirBuffer) != 0)
         return 7;
-
     if (disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
         return 8;
 
@@ -728,6 +787,12 @@ FS::append(std::string filepath1, std::string filepath2)
     if (!sourceFile || sourceFile->type != TYPE_FILE)
         return 3;
 
+    if (!(sourceFile->access_rights & READ)) 
+    {
+        std::cout << "No READ rights on source file" << std::endl;
+        return -7;
+    }
+
     // --- 2. Resolve and find destination file ---
     std::string dstParent, dstName;
     splitParentPath(filepath2, dstParent, dstName);
@@ -750,6 +815,12 @@ FS::append(std::string filepath1, std::string filepath2)
     }
     if (!destFile || destFile->type != TYPE_FILE)
         return 6;
+
+    if (!(destFile->access_rights & WRITE))
+    {
+        std::cout << "No WRITE access on destination file" << std::endl;
+        return -8;
+    }    
 
     // --- 3. Load FAT ---
     if (disk.read(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
@@ -869,11 +940,36 @@ FS::mkdir(std::string dirpath) {
     int res = resolvePath(parentPath, true, parentBlock);
     if (res != 0) return res;
 
-    // 3. Check if name already exists in parent
+    // 3. Read parent directory
     uint8_t buf[BLOCK_SIZE];
     if (disk.read(parentBlock, buf) != 0) return 1;
     dir_entry* entries = reinterpret_cast<dir_entry*>(buf);
 
+    // 3b. Check WRITE permission on parent directory
+    if (parentBlock != ROOT_BLOCK) {
+        uint16_t grandParentBlock = entries[0].first_blk; // ".."
+        uint8_t gpBuf[BLOCK_SIZE];
+        if (disk.read(grandParentBlock, gpBuf) != 0)
+            return 11;
+
+        dir_entry* gpEntries = reinterpret_cast<dir_entry*>(gpBuf);
+        dir_entry* parentEntry = nullptr;
+        int numEntries = BLOCK_SIZE / sizeof(dir_entry);
+        for (int i = 0; i < numEntries; i++) {
+            if (gpEntries[i].first_blk == parentBlock) {
+                parentEntry = &gpEntries[i];
+                break;
+            }
+        }
+        if (parentEntry && !(parentEntry->access_rights & WRITE)) {
+            std::cout << "No WRITE rights on parent directory" << std::endl;
+            return -9;
+        }
+    }
+
+
+
+    // 4. Check if name already exists in parent
     for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) {
         if (strcmp(entries[i].file_name, newName.c_str()) == 0) {
             return 2; // already exists
@@ -902,6 +998,7 @@ FS::mkdir(std::string dirpath) {
     newEntries[0].first_blk = parentBlock;
     newEntries[0].type = TYPE_DIR;
     newEntries[0].size = 0;
+    newEntries[0].access_rights = READ | WRITE | EXECUTE;
 
     disk.write(newBlock, newBuf);
 
@@ -912,6 +1009,7 @@ FS::mkdir(std::string dirpath) {
             entries[i].first_blk = newBlock;
             entries[i].type = TYPE_DIR;
             entries[i].size = 0;
+            entries[i].access_rights = READ | WRITE | EXECUTE;
             break;
         }
     }
@@ -1002,9 +1100,43 @@ FS::pwd()
 
 // chmod <accessrights> <filepath> changes the access rights for the
 // file <filepath> to <accessrights>.
-int
+int 
 FS::chmod(std::string accessrights, std::string filepath)
 {
-    std::cout << "FS::chmod(" << accessrights << "," << filepath << ")\n";
+    // Parse numeric rights (e.g. "6" → 0x06 → read+write)
+    int rights = std::stoi(accessrights);
+    if (rights < 0 || rights > 7) return 1;
+
+    // Split path into parent + name
+    std::string parentPath, name;
+    splitParentPath(filepath, parentPath, name);
+
+    // Resolve parent directory
+    uint16_t parentBlock;
+    if (resolvePath(parentPath, true, parentBlock) != 0)
+        return 2;
+
+    // Load parent directory
+    uint8_t buf[BLOCK_SIZE];
+    if (disk.read(parentBlock, buf) != 0) return 3;
+    dir_entry* entries = reinterpret_cast<dir_entry*>(buf);
+
+    // Find target entry
+    dir_entry* target = nullptr;
+    int numEntries = BLOCK_SIZE / sizeof(dir_entry);
+    for (int i = 0; i < numEntries; i++) {
+        if (strcmp(entries[i].file_name, name.c_str()) == 0) {
+            target = &entries[i];
+            break;
+        }
+    }
+    if (!target) return 4; // not found
+
+    // Update rights
+    target->access_rights = rights;
+
+    // Save back
+    if (disk.write(parentBlock, buf) != 0) return 5;
+
     return 0;
 }

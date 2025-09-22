@@ -33,6 +33,7 @@ private:
     
     int resolvePath(const std::string& path, bool mustBeDir, uint16_t& outBlock);
     void splitParentPath(const std::string& path, std::string& parent, std::string& name);
+    std::string rightsToString(uint8_t rights);
 
 public:
     FS();
