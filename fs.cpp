@@ -2,6 +2,9 @@
 #include <cstring>
 #include <vector>
 #include <iomanip>
+#include <sstream>
+#include <string>
+
 #include "fs.h"
 
 FS::FS()
@@ -14,8 +17,95 @@ FS::~FS()
 
 }
 
+// Splits a path into parent path + filename
+// e.g. "/foo/bar.txt"  -> parent="/foo",  name="bar.txt"
+//      "docs/readme"   -> parent="docs",  name="readme"
+//      "file.txt"      -> parent="current directory",     name="file.txt"
+void
+FS::splitParentPath(const std::string& path, std::string& parent, std::string& name) {
+    // Find last '/' in the path
+    size_t pos = path.find_last_of('/');
+    if (pos == std::string::npos) {
+        // No '/' -> parent is current directory
+        parent = "";
+        name = path;
+    } else if (pos == 0) {
+        // Path like "/file" -> parent is root
+        parent = "/";
+        name = path.substr(1);
+    } else {
+        // General case
+        parent = path.substr(0, pos);
+        name = path.substr(pos + 1);
+    }
+}
+
+int 
+FS::resolvePath(const std::string& path, bool mustBeDir, uint16_t& outBlock) {
+    // 1. Decide starting point
+    uint16_t current = (path.size() > 0 && path[0] == '/') ? ROOT_BLOCK : currentDirectory;
+
+    // 2. Split by '/'
+    std::stringstream ss(path);
+    std::string token;
+    std::vector<std::string> tokens;
+    while (std::getline(ss, token, '/')) {
+        if (!token.empty()) tokens.push_back(token);
+    }
+
+    // Empty path means just "current directory"
+    if (tokens.empty()) {
+        outBlock = current;
+        return 0;
+    }
+
+    // 3. Traverse
+    for (size_t i = 0; i < tokens.size(); i++) {
+        const std::string& part = tokens[i];
+
+        if (part == "..") {
+            if (current == ROOT_BLOCK) {
+                continue; // stay at root
+            }
+            uint8_t buf[BLOCK_SIZE];
+            disk.read(current, buf);
+            dir_entry* entries = reinterpret_cast<dir_entry*>(buf);
+            current = entries[0].first_blk; // parent pointer
+            continue;
+        }
+
+        // Must search current directory for part
+        uint8_t buf[BLOCK_SIZE];
+        if (disk.read(current, buf) != 0) return -1;
+        dir_entry* entries = reinterpret_cast<dir_entry*>(buf);
+
+        bool found = false;
+        for (int j = 0; j < BLOCK_SIZE / sizeof(dir_entry); j++) {
+            if (strcmp(entries[j].file_name, part.c_str()) == 0) {
+                // If it's the last token, maybe check mustBeDir
+                if (i == tokens.size() - 1) {
+                    if (mustBeDir && entries[j].type != TYPE_DIR) return -2;
+                    current = entries[j].first_blk;
+                    found = true;
+                    break;
+                } else {
+                    // must be directory if not last
+                    if (entries[j].type != TYPE_DIR) return -3;
+                    current = entries[j].first_blk;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (!found) return -4; // not found
+    }
+
+    outBlock = current;
+    return 0;
+}
+
 // formats the disk, i.e., creates an empty file system
-int
+int 
 FS::format()
 {
     // Set root(0) and FAT(1) slots to used
@@ -24,36 +114,35 @@ FS::format()
 
     // Mark all blocks as free (except root and FAT)
     const unsigned number_of_blocks = disk.get_no_blocks();
-    for(int i = 2; i < number_of_blocks; i++)
-    {
+    for (int i = 2; i < number_of_blocks; i++) {
         fat[i] = FAT_FREE;
     }
 
-    // Set block buffer to all 0's
-    uint8_t blockBuffer[BLOCK_SIZE];
-    for (int i = 0; i < BLOCK_SIZE; i++)
-    {
-        blockBuffer[i] = 0;
-    }
+    // Initialize root directory block
+    uint8_t rootBuf[BLOCK_SIZE];
+    memset(rootBuf, 0, BLOCK_SIZE);
+    dir_entry* rootEntries = reinterpret_cast<dir_entry*>(rootBuf);
 
-    // Clear root block
-    if (disk.write(ROOT_BLOCK, blockBuffer) != 0)
-    {
+    // Add ".." entry that points to root itself
+    strcpy(rootEntries[0].file_name, "..");
+    rootEntries[0].first_blk = ROOT_BLOCK;  // root points to itself
+    rootEntries[0].type = TYPE_DIR;
+    rootEntries[0].size = 0;
+
+    // Write root block
+    if (disk.write(ROOT_BLOCK, rootBuf) != 0)
         return 1;
-    }
+
     // Write formatted FAT to disk
     if (disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
-    {
         return 2;
-    }
 
     // Clear all other blocks
-    for (int i = 2; i < number_of_blocks; i++)
-    {
-        if (disk.write(i, blockBuffer) != 0)
-        {
+    uint8_t emptyBuf[BLOCK_SIZE];
+    memset(emptyBuf, 0, BLOCK_SIZE);
+    for (int i = 2; i < number_of_blocks; i++) {
+        if (disk.write(i, emptyBuf) != 0)
             return 3;
-        }
     }
 
     return 0;
@@ -61,203 +150,152 @@ FS::format()
 
 // create <filepath> creates a new file on the disk, the data content is
 // written on the following rows (ended with an empty row)
-int
+int 
 FS::create(std::string filepath)
 {
-    // Check max length for file name
-    if (filepath.size() >= 56)
-    {
-        //std::cout << "Error: Filename too long (55 characters maximum)" << std::endl;
-        return 1;
-    }
+    // 1. Split into parent path + file name
+    std::string parentPath, name;
+    splitParentPath(filepath, parentPath, name);
 
-    // Check for duplicate file
+    // Filename length check
+    if (name.size() >= 56) return 1;
+
+    // 2. Resolve parent directory
+    uint16_t parentBlock;
+    if (resolvePath(parentPath, true, parentBlock) != 0)
+        return 2;
+
+    // 3. Read parent directory
     uint8_t dirBuffer[BLOCK_SIZE];
-    if (disk.read(currentDirectory, dirBuffer) != 0)
-    {
-        return 8;
-    }
+    if (disk.read(parentBlock, dirBuffer) != 0)
+        return 3;
     dir_entry* directory_entries = reinterpret_cast<dir_entry*>(dirBuffer);
 
-    for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++)
-    {
-        // If filename isnt empty
-        if (directory_entries[i].file_name[0] != '\0')  
-        {
-            // Return if filename already exists
-            if (strcmp(directory_entries[i].file_name, filepath.c_str()) == 0)
-            {
-                return 3;
-            }
+    // 4. Check for duplicate
+    for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) {
+        if (directory_entries[i].file_name[0] != '\0' &&
+            strcmp(directory_entries[i].file_name, name.c_str()) == 0) {
+            return 4; // already exists
         }
     }
 
-    bool fileDataRead = false;
-    std::string line;
-    std::string completedText;
-    while (!fileDataRead)
-    {
-        std::getline(std::cin, line);
-        if (line.empty())
-        {
-            fileDataRead = true;
-        }
-        else 
-        {
-            completedText.append(line + "\n");
-        }
+    // 5. Read file content from stdin
+    std::string completedText, line;
+    while (true) {
+        if (!std::getline(std::cin, line)) break;
+        if (line.empty()) break;
+        completedText.append(line + "\n");
     }
 
+    // 6. Load FAT
     if (disk.read(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
-    {
-        return 4;
-    }
+        return 5;
 
+    // 7. Allocate blocks
     std::vector<uint16_t> freeBlocks;
     int textLeft = completedText.size();
     int textWritten = 0;
 
-    while (textLeft > 0)
-    {
+    while (textLeft > 0) {
         int freeBlock = -1;
-        int number_of_blocks = disk.get_no_blocks();
-        for (int i = 0; i < number_of_blocks; i++)
-        {
-            // Free block found
-            if (fat[i] == FAT_FREE)
-            {
-                freeBlock = i;
-                break;  
-            }
+        for (int i = 0; i < disk.get_no_blocks(); i++) {
+            if (fat[i] == FAT_FREE) { freeBlock = i; break; }
         }
+        if (freeBlock == -1) return 6; // no space
 
-        // Return if no blocks are free
-        if (freeBlock == -1)
-        {
-            return 5;
-        }
-
-        // Add free block to file's allocated blocks
         freeBlocks.push_back(freeBlock);
 
-        uint8_t textBuffer[BLOCK_SIZE]{};
-        // Amount of data to write (full block 4096 or less if last block for file)
-        int textToSend = std::min(textLeft, int(BLOCK_SIZE));
-        memcpy(textBuffer, completedText.data() + textWritten, textToSend);
+        uint8_t buf[BLOCK_SIZE] = {};
+        int toWrite = std::min(textLeft, (int)BLOCK_SIZE);
+        memcpy(buf, completedText.data() + textWritten, toWrite);
 
-        // Return if failed to write to the free block
-        if (disk.write(freeBlock, textBuffer) != 0)
-        {
-            return 6;
-        }
+        if (disk.write(freeBlock, buf) != 0) return 7;
 
-        // Update amount of text left to write to blocks
-        textWritten += textToSend;
-        textLeft -= textToSend;
-    }
-    
-    for (int i = 0; i < freeBlocks.size(); i++)
-    {
-        if (i + 1 < freeBlocks.size())  // If NOT last block
-        {
-            fat[freeBlocks[i]] = freeBlocks[i + 1]; // Link first FAT block to the next in chain
-        }
-        else 
-        {
-            fat[freeBlocks[i]] = FAT_EOF;   // Set FAT block to last block in chain
-        }
+        textWritten += toWrite;
+        textLeft -= toWrite;
     }
 
-    if (disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0) // Update FAT in disk
-    {
-        return 7;
-    } 
-    dir_entry newFile{};    // Initialize struct to 0
-    strncpy(newFile.file_name, filepath.c_str(), sizeof(newFile.file_name) - 1);    // Copy filepath to struct
+    // 8. Update FAT chain
+    for (int i = 0; i < (int)freeBlocks.size(); i++) {
+        fat[freeBlocks[i]] = (i + 1 < (int)freeBlocks.size())
+                           ? freeBlocks[i + 1]
+                           : FAT_EOF;
+    }
+    if (disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
+        return 8;
+
+    // 9. Create dir_entry
+    dir_entry newFile{};
+    strncpy(newFile.file_name, name.c_str(), sizeof(newFile.file_name) - 1);
     newFile.file_name[sizeof(newFile.file_name) - 1] = '\0';
-    newFile.size = completedText.size();    // Set size of the contents of the file to the new file
-    newFile.first_blk = freeBlocks.empty() ? 0xFFFF: freeBlocks[0];
+    newFile.size = completedText.size();
+    newFile.first_blk = freeBlocks.empty() ? 0xFFFF : freeBlocks[0];
     newFile.type = TYPE_FILE;
-    newFile.access_rights = READ | WRITE; // Read | Write Permissions
+    newFile.access_rights = READ | WRITE;
 
-    // Find a free `dir_entry` slot (all zeros)
-    bool entryAvailable = false;
-    for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); ++i)
-    {
-        if (directory_entries[i].file_name[0] == '\0')
-        {
+    // 10. Insert into parent directory
+    bool inserted = false;
+    for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) {
+        if (directory_entries[i].file_name[0] == '\0') {
             directory_entries[i] = newFile;
-            entryAvailable = true;
+            inserted = true;
             break;
         }
     }
+    if (!inserted) return 9; // directory full
 
-    // root directory full
-    if (!entryAvailable)
-    {
-        return 9;
-    }
-
-    // Write back root block
-    if (disk.write(currentDirectory, dirBuffer) != 0)
-    {
+    if (disk.write(parentBlock, dirBuffer) != 0)
         return 10;
-    }
 
     return 0;
 }
 
 // cat <filepath> reads the content of a file and prints it on the screen
 int
-FS::cat(std::string filepath)
+FS::cat(std::string filepath) 
 {
-    uint8_t dirBuffer[BLOCK_SIZE];
-    if (disk.read(currentDirectory, dirBuffer) != 0)
-    {
-        return 1;
-    }
+    uint16_t block;
+    int res = resolvePath(filepath, false, block); // mustBeDir = false
+    if (res != 0) return res;
 
-    dir_entry* directory_entries = reinterpret_cast<dir_entry*>(dirBuffer);
+    // Now `block` is the *first block* of the file.
+    // But we still need its metadata: size and type.
+    // So: we have to re-find the dir_entry for this file.
+
+    // --- Find the parent directory + entry ---
+    std::string parentPath, filename;
+    splitParentPath(filepath, parentPath, filename); // helper, see below
+
+    uint16_t parentBlock;
+    res = resolvePath(parentPath, true, parentBlock);
+    if (res != 0) return res;
+
+    uint8_t buf[BLOCK_SIZE];
+    disk.read(parentBlock, buf);
+    dir_entry* entries = reinterpret_cast<dir_entry*>(buf);
+
     dir_entry* targetFile = nullptr;
-
-    for (int i = 0; i < BLOCK_SIZE /sizeof(dir_entry); i++)
-    {
-        if (directory_entries[i].file_name[0] != '\0')
-        {
-            if (strcmp(directory_entries[i].file_name, filepath.c_str()) == 0)
-            {
-                targetFile = &directory_entries[i];
-                break;
-            }
+    for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) {
+        if (strcmp(entries[i].file_name, filename.c_str()) == 0) {
+            targetFile = &entries[i];
+            break;
         }
     }
+    if (!targetFile) return 2;
+    if (targetFile->type == TYPE_DIR) return 3;
 
-    if (!targetFile)
-    {
-        return 2;
-    }
-
-    if (targetFile->type == TYPE_DIR)
-    {
-        //std::cout << "ERROR: file is a directory" << std::endl;
-        return 3;
-    }
-
+    // --- Load FAT ---
     if (disk.read(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
-    {
         return 4;
-    }
 
+    // --- Walk file blocks and print ---
     int16_t fileBlock = static_cast<int16_t>(targetFile->first_blk);
     int bytesToRead = targetFile->size;
 
-    while (fileBlock != FAT_EOF && bytesToRead > 0)
-    {
+    while (fileBlock != FAT_EOF && bytesToRead > 0) {
         uint8_t blockBuffer[BLOCK_SIZE];
         if (disk.read(fileBlock, blockBuffer) != 0)
-        {
             return 5;
-        }      
 
         int bytesToPrint = std::min(bytesToRead, BLOCK_SIZE);
         std::cout.write(reinterpret_cast<char*>(blockBuffer), bytesToPrint);
@@ -267,7 +305,6 @@ FS::cat(std::string filepath)
     }
 
     std::cout << std::endl;
-
     return 0;
 }
 
@@ -282,9 +319,15 @@ FS::ls()
     }
 
     // Leave room for filename
-    std::cout << std::left << std::setw(56) << "name" << std::right << "type\t size" << std::endl;
+    std::cout 
+    //<< std::left << std::setw(56) 
+    << "name" 
+    //<< std::right 
+    << "\t type\t size" << std::endl;
+    
     std::string type = "";
     std::string size = "-";
+    
     dir_entry* dir_entries = reinterpret_cast<dir_entry*>(dirBuffer);
     for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++)
     {
@@ -293,7 +336,7 @@ FS::ls()
             continue;
         }
 
-        if (currentDirectory != ROOT_BLOCK && i == 0)
+        if (strcmp(dir_entries[i].file_name, "..") == 0)
         {
             continue;
         }
@@ -301,788 +344,581 @@ FS::ls()
         type = (dir_entries[i].type == TYPE_FILE) ? "file" : "dir";
         if (type == "dir")
         {
-            std::cout << std::left << std::setw(56)
-            << dir_entries[i].file_name << std::right
-            << type << "\t "
+            std::cout 
+            //<< std::left << std::setw(56)
+            << dir_entries[i].file_name 
+            //<< std::right
+            << "\t " << type << "\t "
             << size << std::endl;
         } 
         else
         {
-            std::cout << std::left << std::setw(56)
-            << dir_entries[i].file_name << std::right
-            << type << "\t "
+            std::cout
+            //<< std::left << std::setw(56)
+            << dir_entries[i].file_name 
+            //<< std::right
+            << "\t " << type << "\t "
             << dir_entries[i].size << std::endl;
         }
         
     }
-
-    std::cout << std::endl;
+    //std::cout << std::endl;
 
     return 0;
 }
 
 // cp <sourcepath> <destpath> makes an exact copy of the file
 // <sourcepath> to a new file <destpath>
-int
+int 
 FS::cp(std::string sourcepath, std::string destpath)
 {
+    // --- Split source path ---
+    std::string srcParent, srcName;
+    splitParentPath(sourcepath, srcParent, srcName);
 
-    // Check max length for file name
-    if (destpath.size() >= 56)
-    {
-        //std::cout << "Error: Filename too long (55 characters maximum)" << std::endl;
-        return 1;
-    }
+    // --- Resolve source parent directory ---
+    uint16_t srcDirBlock;
+    if (resolvePath(srcParent, true, srcDirBlock) != 0)
+        return 1; // source parent invalid
 
-    if (sourcepath.size() >= 56)
-    {
-        //std::cout << "Error: Filename too long (55 characters maximum)" << std::endl;
+    // --- Find source file ---
+    uint8_t srcDirBuf[BLOCK_SIZE];
+    if (disk.read(srcDirBlock, srcDirBuf) != 0)
         return 2;
-    }
 
-    // Read in the root directory
-    uint8_t dirBuffer[BLOCK_SIZE];
-    if (disk.read(currentDirectory, dirBuffer) != 0)
-    {
-        return 3;
-    }
-
-    dir_entry* dir_entries = reinterpret_cast<dir_entry*>(dirBuffer);
-    dir_entry* sourceFile = nullptr;
-    dir_entry* destFile = nullptr;
-
-    bool destpathAlreadyExists = false;
-    int number_of_entries = BLOCK_SIZE / sizeof(dir_entry); 
-    for (int i = 0; i < number_of_entries; i++)
-    {
-        if (dir_entries[i].file_name[0] != '\0')
-        {
-            // Find the <sourcepath> in directory
-            if(strcmp(dir_entries[i].file_name, sourcepath.c_str()) == 0)
-            {
-                sourceFile = &dir_entries[i];
-            }
-
-            // Check if <destpath> already exists in directory
-            if (strcmp(dir_entries[i].file_name, destpath.c_str()) == 0)
-            {
-                destFile = &dir_entries[i];
-            }
+    dir_entry* srcEntries = reinterpret_cast<dir_entry*>(srcDirBuf);
+    dir_entry* srcFile = nullptr;
+    for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) {
+        if (srcEntries[i].file_name[0] != '\0' &&
+            strcmp(srcEntries[i].file_name, srcName.c_str()) == 0) {
+            srcFile = &srcEntries[i];
+            break;
         }
     }
-    if (!sourceFile)
-    {
-        return 4;
-    }
- 
-    if (disk.read(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) !=0)
-    {
+    if (!srcFile || srcFile->type != TYPE_FILE)
+        return 3; // source not found or is a dir
+
+    // --- Handle destination ---
+    std::string dstParent, dstName;
+    splitParentPath(destpath, dstParent, dstName);
+
+    uint16_t dstDirBlock;
+    if (resolvePath(dstParent, true, dstDirBlock) != 0)
+        return 4; // invalid dest parent
+
+    // Load destination directory
+    uint8_t dstDirBuf[BLOCK_SIZE];
+    if (disk.read(dstDirBlock, dstDirBuf) != 0)
         return 5;
+    dir_entry* dstEntries = reinterpret_cast<dir_entry*>(dstDirBuf);
+
+    // If destpath refers to an existing directory, copy inside it with same name
+    if (!dstName.empty()) {
+        for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) {
+            if (dstEntries[i].file_name[0] != '\0' &&
+                strcmp(dstEntries[i].file_name, dstName.c_str()) == 0 &&
+                dstEntries[i].type == TYPE_DIR) {
+                // It's a directory → adjust
+                dstParent = destpath;
+                dstName = srcName;
+                if (resolvePath(dstParent, true, dstDirBlock) != 0)
+                    return 6;
+                if (disk.read(dstDirBlock, dstDirBuf) != 0)
+                    return 7;
+                dstEntries = reinterpret_cast<dir_entry*>(dstDirBuf);
+                break;
+            }
+        }
+    } else {
+        // Path ended with "/" → means directory, keep same name
+        dstName = srcName;
     }
 
-    // Extract file data from sourcefile's blocks
-    std::string fileData;
-    int16_t block = static_cast<int16_t>(sourceFile->first_blk);
-    int bytesToRead = sourceFile->size;
-
-    while (block != FAT_EOF && bytesToRead > 0)
-    {
-        uint8_t blockBuffer[BLOCK_SIZE];
-        if (disk.read(block, blockBuffer) != 0)
-        {
-            return 6;
+    // Ensure file with dstName doesn’t already exist
+    for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) {
+        if (dstEntries[i].file_name[0] != '\0' &&
+            strcmp(dstEntries[i].file_name, dstName.c_str()) == 0) {
+            return 8; // already exists
         }
+    }
 
-        int bytesToWrite = std::min(bytesToRead, BLOCK_SIZE);
-        fileData.append(reinterpret_cast<char*>(blockBuffer), bytesToWrite);
+    // --- Load FAT ---
+    if (disk.read(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
+        return 9;
 
-        bytesToRead -= bytesToWrite;
+    // --- Copy file data into string ---
+    std::string fileData;
+    int16_t block = srcFile->first_blk;
+    int bytesLeft = srcFile->size;
+    while (block != FAT_EOF && bytesLeft > 0) {
+        uint8_t buf[BLOCK_SIZE];
+        if (disk.read(block, buf) != 0)
+            return 10;
+        int bytesToRead = std::min(bytesLeft, BLOCK_SIZE);
+        fileData.append(reinterpret_cast<char*>(buf), bytesToRead);
+        bytesLeft -= bytesToRead;
         block = fat[block];
     }
 
-    // Find free blocks to use for new file
+    // --- Allocate new blocks for copy ---
     std::vector<uint16_t> freeBlocks;
-    int bytesLeftToWrite = fileData.size();
     int bytesWritten = 0;
-    while (bytesLeftToWrite > 0)
-    {
+    int bytesLeftToWrite = fileData.size();
+    while (bytesLeftToWrite > 0) {
         int freeBlock = -1;
-        int number_of_blocks = disk.get_no_blocks();
-
-        for (int i = 0; i < number_of_blocks; i++)
-        {
-            if (fat[i] == FAT_FREE)
-            {
+        for (int i = 0; i < disk.get_no_blocks(); i++) {
+            if (fat[i] == FAT_FREE) {
                 freeBlock = i;
                 break;
             }
         }
-
-        // Return if no free blocks are avaiable (Directory is full)
-        if (freeBlock == -1)
-        {
-            return 7;
-        }
+        if (freeBlock == -1) return 11; // no free blocks
 
         freeBlocks.push_back(freeBlock);
 
-        uint8_t blockBuffer[BLOCK_SIZE]{};
+        uint8_t buf[BLOCK_SIZE] = {};
         int bytesToWrite = std::min(bytesLeftToWrite, BLOCK_SIZE);
-        memcpy(blockBuffer, fileData.data() + bytesWritten, bytesToWrite);
+        memcpy(buf, fileData.data() + bytesWritten, bytesToWrite);
 
-        if (disk.write(freeBlock, blockBuffer) != 0)
-        {
-            return 8;
-        }
+        if (disk.write(freeBlock, buf) != 0)
+            return 12;
 
         bytesWritten += bytesToWrite;
         bytesLeftToWrite -= bytesToWrite;
     }
 
-    // Update the FAT by writing the blocks into the new file's chain
-    for (int i = 0; i < freeBlocks.size(); i++)
-    {
-        if (i + 1 < freeBlocks.size())
-        {
-            fat[freeBlocks[i]] = freeBlocks[i + 1];
-        }
-        else 
-        {
-            fat[freeBlocks[i]] = FAT_EOF;
-        }
+    // --- Link blocks in FAT ---
+    for (int i = 0; i < freeBlocks.size(); i++) {
+        fat[freeBlocks[i]] = (i + 1 < freeBlocks.size()) ? freeBlocks[i + 1] : FAT_EOF;
     }
     if (disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
-    {
-        return 9;
-    }
+        return 13;
 
-    // Create a new entry in the root directory for the file
-    dir_entry newFile{};    
-    std::string newName;
-       
-    if (destFile && destFile->type == TYPE_DIR )
-    {
-       newName = sourcepath;
-    }
-    else
-    {
-        newName = destpath;
-    }
-
-    if (newName == "..") 
-    {
-        //std::cout << "Error: Invalid filename" << std::endl;
-        return 10;
-        
-    }
-
-    strncpy(newFile.file_name, newName.c_str(), sizeof(newFile.file_name) - 1);
-    newFile.file_name[sizeof(newFile.file_name) - 1] = '\0';  // Add null terminator to end of filename
-    newFile.size = fileData.size(); // Assign data size to new file entry from string
-    newFile.first_blk = freeBlocks.empty() ? 0xFFFF : freeBlocks[0]; // Fail safe if the file has no data in it
+    // --- Create new dir_entry in destination ---
+    dir_entry newFile{};
+    strncpy(newFile.file_name, dstName.c_str(), sizeof(newFile.file_name) - 1);
+    newFile.file_name[sizeof(newFile.file_name) - 1] = '\0';
+    newFile.first_blk = freeBlocks.empty() ? 0xFFFF : freeBlocks[0];
+    newFile.size = fileData.size();
     newFile.type = TYPE_FILE;
     newFile.access_rights = READ | WRITE;
 
-    if (destFile && destFile->type == TYPE_DIR)
-    {
-        uint8_t subDirBuffer[BLOCK_SIZE];
-        if (disk.read(destFile->first_blk, subDirBuffer) != 0)
-        {
-            return 12;
-        }
-
-        dir_entry* subDir_entries = reinterpret_cast<dir_entry*>(subDirBuffer);
-
-        // Check for duplicate files in sub directory
-        for (int i = 0; i < number_of_entries; i++)
-        {
-            if (subDir_entries[i].file_name[0] != '\0' && strcmp(subDir_entries[i].file_name, newFile.file_name) == 0)
-            {
-                    //std::cout << "ERROR: file with same name already exists in subdirectory" << std::endl;
-                    return 14;  
-            }
-        }
-
-        // Look for an empty slot for the new file in sub directory
-        bool freeSubDirEntry = false;
-        for (int i = 0; i < number_of_entries; i++)
-        {
-            if (subDir_entries[i].file_name[0] == '\0' && strcmp(subDir_entries[i].file_name, "..") != 0)
-            {
-                subDir_entries[i] = newFile;
-                freeSubDirEntry = true;
-                break;
-            }
-        }
-
-        if (!freeSubDirEntry)
-        {
-            //std::cout << "ERROR: sub directory is full." << std::endl;
-            return 15;
-        }
-
-        // Update sub directory with new file
-        if (disk.write(destFile->first_blk, subDirBuffer) != 0)
-        {
-            return 16;
+    bool inserted = false;
+    for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) {
+        if (dstEntries[i].file_name[0] == '\0') {
+            dstEntries[i] = newFile;
+            inserted = true;
+            break;
         }
     }
-    else
-    {
-        // Check for duplicate filename in current directory
-        for (int i = 0; i < number_of_entries; i++)
-        {
-            if (dir_entries[i].file_name[0] != '\0' &&
-                strcmp(dir_entries[i].file_name, newFile.file_name) == 0)
-            {
-                // File with same name already exists in current directory
-                return 17;
-            }
-        }
-       
-        // Find free entry in current directory for new file
-        bool freeCurDirEntry = false;
-        for (int i = 0; i < number_of_entries; i++)
-        {
-            if (dir_entries[i].file_name[0] == '\0' && strcmp(dir_entries[i].file_name, "..") != 0)
-            {
-              
-                dir_entries[i] = newFile;
-                freeCurDirEntry = true;
-                break;
-        
-            }
-        }
-        
-        if (!freeCurDirEntry)
-        {
-            //std::cout << "ERROR: current directory is full." << std::endl;
-            return 18;
-        }
+    if (!inserted) return 14; // no space in directory
 
-        // Update Current Directory with new file
-        if (disk.write(currentDirectory, dirBuffer) != 0)
-        {
-            return 19; 
-        }
-    }
+    if (disk.write(dstDirBlock, dstDirBuf) != 0)
+        return 15;
 
     return 0;
 }
 
 // mv <sourcepath> <destpath> renames the file <sourcepath> to the name <destpath>,
 // or moves the file <sourcepath> to the directory <destpath> (if dest is a directory)
-int
+int 
 FS::mv(std::string sourcepath, std::string destpath)
 {
-    if (sourcepath == destpath)
-    {
-        return 0;
-    }
+    if (sourcepath == destpath) return 0;
 
-    // Check max length for file name
-    if (destpath.size() >= 56)
-    {
-        //std::cout << "Error: Filename too long (55 characters maximum)" << std::endl;
-        return 1;
-    }
+    // --- Split source path ---
+    std::string srcParent, srcName;
+    splitParentPath(sourcepath, srcParent, srcName);
 
-    // Read in the root directory
-    uint8_t dirBuffer[BLOCK_SIZE];
-    if (disk.read(currentDirectory, dirBuffer) != 0)
-    {
+    uint16_t srcDirBlock;
+    if (resolvePath(srcParent, true, srcDirBlock) != 0)
+        return 1; // invalid source parent
+
+    // --- Load source dir ---
+    uint8_t srcBuf[BLOCK_SIZE];
+    if (disk.read(srcDirBlock, srcBuf) != 0)
         return 2;
-    }
+    dir_entry* srcEntries = reinterpret_cast<dir_entry*>(srcBuf);
 
-    dir_entry* dir_entries = reinterpret_cast<dir_entry*>(dirBuffer);
-    dir_entry* sourceFile = nullptr;
-    dir_entry* destFile = nullptr;
-
-     int number_of_entries = BLOCK_SIZE / sizeof(dir_entry);
-    for (int i = 0; i < number_of_entries; i++)
-    {
-        if (dir_entries[i].file_name[0] != '\0')
-        {
-            // Find the <sourcepath> in directory
-            if (strcmp(dir_entries[i].file_name, sourcepath.c_str()) == 0)
-            {
-                sourceFile = &dir_entries[i];
-            }
-
-            // Check if <destpath> already exists in directory
-            if (strcmp(dir_entries[i].file_name, destpath.c_str()) == 0)
-            {
-                destFile = &dir_entries[i];
-            }
+    // --- Find source entry ---
+    dir_entry* srcFile = nullptr;
+    int numEntries = BLOCK_SIZE / sizeof(dir_entry);
+    for (int i = 0; i < numEntries; i++) {
+        if (srcEntries[i].file_name[0] != '\0' &&
+            strcmp(srcEntries[i].file_name, srcName.c_str()) == 0) {
+            srcFile = &srcEntries[i];
+            break;
         }
     }
-    if (!sourceFile)
-    {
-        //std::cout << "ERROR: sourcefile was not found" << std::endl;
-        return 2;
-    }
+    if (!srcFile) return 3; // not found
 
-    // Move source file to existing sub directory
-    if (destFile && destFile->type == TYPE_DIR)
-    {
-        uint8_t subDirBuffer[BLOCK_SIZE];
-        if (disk.read(destFile->first_blk, subDirBuffer) != 0)
-        {
-            return 4;
-        }
+    // --- Split dest path ---
+    std::string dstParent, dstName;
+    splitParentPath(destpath, dstParent, dstName);
 
-        dir_entry* subDir_entries = reinterpret_cast<dir_entry*>(subDirBuffer);
+    uint16_t dstDirBlock;
+    if (resolvePath(dstParent, true, dstDirBlock) != 0)
+        return 4; // invalid dest parent
 
-        bool freeSubDirEntry = false;
-        for (int i = 0; i < number_of_entries; i++)
-        {
-            if (subDir_entries[i].file_name[0] == '\0')
-            {
-                subDir_entries[i] = *sourceFile;
-                freeSubDirEntry = true;
+    // --- Load dest dir ---
+    uint8_t dstBuf[BLOCK_SIZE];
+    if (disk.read(dstDirBlock, dstBuf) != 0)
+        return 5;
+    dir_entry* dstEntries = reinterpret_cast<dir_entry*>(dstBuf);
+
+    // --- If dest is an existing directory, move into it ---
+    if (!dstName.empty()) {
+        for (int i = 0; i < numEntries; i++) {
+            if (dstEntries[i].file_name[0] != '\0' &&
+                strcmp(dstEntries[i].file_name, dstName.c_str()) == 0 &&
+                dstEntries[i].type == TYPE_DIR) {
+                // move into that directory, keep name
+                dstParent = destpath;
+                dstName = srcName;
+                if (resolvePath(dstParent, true, dstDirBlock) != 0)
+                    return 6;
+                if (disk.read(dstDirBlock, dstBuf) != 0)
+                    return 7;
+                dstEntries = reinterpret_cast<dir_entry*>(dstBuf);
                 break;
             }
         }
-
-        if (!freeSubDirEntry)
-        {
-            std::cout << "ERROR: sub directory is full" << std::endl;
-            return 5;
-        }
-
-        memset(sourceFile, 0, sizeof(dir_entry));
-
-        if (disk.write(destFile->first_blk, subDirBuffer) != 0)
-        {
-            return 6;
-        }
-        if (disk.write(currentDirectory, dirBuffer) != 0)
-        {
-            return 7;
-        }
-
-        return 0;
+    } else {
+        // path ended with '/', so use same name
+        dstName = srcName;
     }
 
-    if (destFile)
-    {
-        //std::cout << "ERROR: destfile was not found << std::endl;
-        return 8;
+    // --- Prevent overwrite ---
+    for (int i = 0; i < numEntries; i++) {
+        if (dstEntries[i].file_name[0] != '\0' &&
+            strcmp(dstEntries[i].file_name, dstName.c_str()) == 0) {
+            return 8; // already exists
+        }
     }
 
-    strncpy(sourceFile->file_name, destpath.c_str(), sizeof(sourceFile->file_name) - 1);
-    sourceFile->file_name[sizeof(sourceFile->file_name) - 1] = '\0';
-
-    if (disk.write(currentDirectory, dirBuffer) != 0)
-    {
-        return 9;        
+    // --- Insert entry into dest dir ---
+    bool inserted = false;
+    for (int i = 0; i < numEntries; i++) {
+        if (dstEntries[i].file_name[0] == '\0') {
+            dir_entry moved = *srcFile;
+            strncpy(moved.file_name, dstName.c_str(), sizeof(moved.file_name) - 1);
+            moved.file_name[sizeof(moved.file_name) - 1] = '\0';
+            dstEntries[i] = moved;
+            inserted = true;
+            break;
+        }
     }
+    if (!inserted) return 9; // dest dir full
+
+    if (disk.write(dstDirBlock, dstBuf) != 0)
+        return 10;
+
+    // --- Clear source entry ---
+    memset(srcFile, 0, sizeof(dir_entry));
+    if (disk.write(srcDirBlock, srcBuf) != 0)
+        return 11;
 
     return 0;
 }
 
 // rm <filepath> removes / deletes the file <filepath>
-int
+int 
 FS::rm(std::string filepath)
 {
+    // --- 1. Split into parent + filename ---
+    std::string parentPath, name;
+    splitParentPath(filepath, parentPath, name);
+
+    // --- 2. Resolve parent directory ---
+    uint16_t parentBlock;
+    if (resolvePath(parentPath, true, parentBlock) != 0)
+        return 1; // invalid parent path
+
+    // --- 3. Read parent directory ---
     uint8_t dirBuffer[BLOCK_SIZE];
-    if (disk.read(currentDirectory, dirBuffer) != 0)
-    {
-        return 1;
-    }
-    
+    if (disk.read(parentBlock, dirBuffer) != 0)
+        return 2;
+
     dir_entry* dir_entries = reinterpret_cast<dir_entry*>(dirBuffer);
     dir_entry* entryToRemove = nullptr;
-
     int number_of_entries = BLOCK_SIZE / sizeof(dir_entry);
-    for (int i = 0; i < number_of_entries; i++) 
-    {
-        if (dir_entries[i].file_name[0] != '\0')
-        {
-            if (strcmp(dir_entries[i].file_name, filepath.c_str()) == 0)
-            {
-                entryToRemove = &dir_entries[i];
+
+    for (int i = 0; i < number_of_entries; i++) {
+        if (dir_entries[i].file_name[0] != '\0' &&
+            strcmp(dir_entries[i].file_name, name.c_str()) == 0) {
+            entryToRemove = &dir_entries[i];
+            break;
+        }
+    }
+    if (!entryToRemove) return 3; // not found
+
+    // --- 4. Handle directory case ---
+    if (entryToRemove->type == TYPE_DIR) {
+        uint8_t subDirBuffer[BLOCK_SIZE];
+        if (disk.read(entryToRemove->first_blk, subDirBuffer) != 0)
+            return 4;
+
+        dir_entry* subDir_entries = reinterpret_cast<dir_entry*>(subDirBuffer);
+
+        bool empty = true;
+        for (int i = 0; i < number_of_entries; i++) {
+            if (subDir_entries[i].file_name[0] != '\0' &&
+                strcmp(subDir_entries[i].file_name, "..") != 0) {
+                empty = false;
                 break;
             }
         }
-    }
-    if (!entryToRemove)
-    {
-        //std::cout << "ERROR: File not found" << std::endl;
-        return 2;
-    }
-    
-    if (entryToRemove->type == TYPE_DIR)
-    {
-        uint8_t subDirBuffer[BLOCK_SIZE];
-        if (disk.read(entryToRemove->first_blk, subDirBuffer) != 0)
-        {
-            return 3;
-        }
-
-        dir_entry* subDir_entries = reinterpret_cast<dir_entry*>(subDirBuffer);
-        
-        bool empty = true;
-        for (int i = 0; i < number_of_entries; i++)
-        {
-            if (subDir_entries[i].file_name[0] != '\0')
-            {
-                if (strcmp(subDir_entries[i].file_name, "..") != 0)
-                {
-                    empty = false;
-                    break;
-                }
-            }
-        }
-
-        if (!empty)
-        {
+        if (!empty) {
             std::cout << "ERROR: can't remove non-empty directory" << std::endl;
-            return 4;
+            return 5;
         }
     }
 
-
+    // --- 5. Free blocks in FAT ---
     if (disk.read(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
-    {
-        return 5;
-    }
+        return 6;
 
     int16_t currentBlock = static_cast<int16_t>(entryToRemove->first_blk);
- 
-    // Traverse the FAT chain while freeing all blocks allocated for the entry
-    while (currentBlock != FAT_EOF)
-    {
-        int16_t nextBlock = fat[currentBlock];
-        fat[currentBlock] = FAT_FREE;
-        currentBlock = nextBlock;
+
+    if (currentBlock != 0xFFFF) { // <- guard for empty file
+        while (currentBlock != FAT_EOF) {
+            int16_t nextBlock = fat[currentBlock];
+            fat[currentBlock] = FAT_FREE;
+            currentBlock = nextBlock;
+        }
     }
 
+    // --- 6. Clear directory entry ---
     memset(entryToRemove, 0, sizeof(dir_entry));
 
-    if (disk.write(currentDirectory, dirBuffer) != 0)
-    {
-        return 6;
-    }
-    
-    if (disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
-    {
+    if (disk.write(parentBlock, dirBuffer) != 0)
         return 7;
-    }
+
+    if (disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
+        return 8;
 
     return 0;
 }
 
 // append <filepath1> <filepath2> appends the contents of file <filepath1> to
 // the end of file <filepath2>. The file <filepath1> is unchanged.
-int
+int 
 FS::append(std::string filepath1, std::string filepath2)
 {
-    // Read root directory
-    uint8_t rootBuffer[BLOCK_SIZE];
-    if (disk.read(ROOT_BLOCK, rootBuffer) != 0)
-    {
+    // --- 1. Resolve and find source file ---
+    std::string srcParent, srcName;
+    splitParentPath(filepath1, srcParent, srcName);
+
+    uint16_t srcDirBlock;
+    if (resolvePath(srcParent, true, srcDirBlock) != 0)
         return 1;
-    }
-    dir_entry* directory_entries = reinterpret_cast<dir_entry*>(rootBuffer);
 
-    // Look for source and destination files
-    dir_entry* sourceFile = nullptr;
-    dir_entry* destFile = nullptr;
-    for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++)
-    {
-        if (directory_entries[i].file_name[0] != '\0') 
-        {
-            if (strcmp(directory_entries[i].file_name, filepath1.c_str()) == 0)
-            {
-                sourceFile = &directory_entries[i];
-            }
-    
-            if (strcmp(directory_entries[i].file_name, filepath2.c_str()) == 0)
-            {
-                destFile = &directory_entries[i]; 
-            } 
-        }
-    }
-    if (!sourceFile) 
-    {
+    uint8_t srcBuf[BLOCK_SIZE];
+    if (disk.read(srcDirBlock, srcBuf) != 0)
         return 2;
+
+    dir_entry* srcEntries = reinterpret_cast<dir_entry*>(srcBuf);
+    dir_entry* sourceFile = nullptr;
+    for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) {
+        if (strcmp(srcEntries[i].file_name, srcName.c_str()) == 0) {
+            sourceFile = &srcEntries[i];
+            break;
+        }
     }
-    if (!destFile) 
-    {
+    if (!sourceFile || sourceFile->type != TYPE_FILE)
         return 3;
-    }
 
-    // Load FAT into memory
-    if (disk.read(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
-    {
+    // --- 2. Resolve and find destination file ---
+    std::string dstParent, dstName;
+    splitParentPath(filepath2, dstParent, dstName);
+
+    uint16_t dstDirBlock;
+    if (resolvePath(dstParent, true, dstDirBlock) != 0)
         return 4;
+
+    uint8_t dstBuf[BLOCK_SIZE];
+    if (disk.read(dstDirBlock, dstBuf) != 0)
+        return 5;
+
+    dir_entry* dstEntries = reinterpret_cast<dir_entry*>(dstBuf);
+    dir_entry* destFile = nullptr;
+    for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) {
+        if (strcmp(dstEntries[i].file_name, dstName.c_str()) == 0) {
+            destFile = &dstEntries[i];
+            break;
+        }
     }
+    if (!destFile || destFile->type != TYPE_FILE)
+        return 6;
 
-    // Read entire source file into memory
+    // --- 3. Load FAT ---
+    if (disk.read(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
+        return 7;
+
+    // --- 4. Read entire source file into memory ---
     std::string sourceFileData;
-    int16_t currentBlock = static_cast<int16_t>(sourceFile->first_blk);
-    int bytesLeftToRead = sourceFile->size;
+    int16_t currentBlock = sourceFile->first_blk;
+    int bytesLeft = sourceFile->size;
 
-    while (currentBlock != FAT_EOF && bytesLeftToRead > 0)
-    {
-        if (currentBlock < 0 || currentBlock >= disk.get_no_blocks())
-        {
-            return 5;
-        }
+    while (currentBlock != FAT_EOF && bytesLeft > 0) {
+        uint8_t buf[BLOCK_SIZE];
+        if (disk.read(currentBlock, buf) != 0)
+            return 8;
 
-        uint8_t blockBuffer[BLOCK_SIZE]{};
-        if (disk.read(currentBlock, blockBuffer) != 0)
-        {
-            return 6;
-        }
+        int bytesToRead = std::min(bytesLeft, BLOCK_SIZE);
+        sourceFileData.append(reinterpret_cast<char*>(buf), bytesToRead);
 
-        int bytesToRead = std::min(bytesLeftToRead, BLOCK_SIZE);
-        sourceFileData.append(reinterpret_cast<char*>(blockBuffer), bytesToRead);
-
-        bytesLeftToRead -= bytesToRead;
+        bytesLeft -= bytesToRead;
         currentBlock = fat[currentBlock];
     }
 
-    // Sourcefile is empty, nothing to append
     if (sourceFileData.empty())
-    {
-        return 0;
-    } 
+        return 0; // nothing to append
 
-    std::vector<int16_t> destNewBlocks;
+    // --- 5. Append to dest ---
     int sourceFileBytesLeft = sourceFileData.size();
     int bytesWritten = 0;
-    int number_of_blocks = disk.get_no_blocks();
+    std::vector<int16_t> destNewBlocks;
 
-    // If destination file is empty
-    if (destFile->first_blk == 0xFFFF)
-    {
-    }
-    else
-    {
-        // Find last block of dest
+    if (destFile->first_blk != 0xFFFF) {
+        // Find last block
         int16_t lastBlock = destFile->first_blk;
         while (fat[lastBlock] != FAT_EOF)
-        {
             lastBlock = fat[lastBlock];
-        }
 
         // See if last block has free space
         int usedBytes = destFile->size % BLOCK_SIZE;
-        if (usedBytes != 0 && sourceFileBytesLeft > 0)
-        {
-            uint8_t blockBuffer[BLOCK_SIZE];
-            if (disk.read(lastBlock, blockBuffer) != 0)
-            {
-                return 8;
-            }
+        if (usedBytes != 0 && sourceFileBytesLeft > 0) {
+            uint8_t blockBuf[BLOCK_SIZE];
+            if (disk.read(lastBlock, blockBuf) != 0)
+                return 9;
 
             int freeSpace = BLOCK_SIZE - usedBytes;
             int bytesToCopy = std::min(sourceFileBytesLeft, freeSpace);
 
-            memcpy(blockBuffer + usedBytes, sourceFileData.data() + bytesWritten, bytesToCopy);
+            memcpy(blockBuf + usedBytes, sourceFileData.data() + bytesWritten, bytesToCopy);
 
-            if (disk.write(lastBlock, blockBuffer) != 0)
-            {
-                return 8;
-            }
+            if (disk.write(lastBlock, blockBuf) != 0)
+                return 9;
 
             bytesWritten += bytesToCopy;
             sourceFileBytesLeft -= bytesToCopy;
         }
     }
 
-    // Allocate NEW blocks if there’s still data left
-    while (sourceFileBytesLeft > 0)
-    {
-        int emptyBlock = -1;
-        for (int i = 0; i < number_of_blocks; i++)
-        {
-            if (fat[i] == FAT_FREE)
-            {
-                emptyBlock = i;
-                break;
-            }
+    // Allocate new blocks if needed
+    while (sourceFileBytesLeft > 0) {
+        int freeBlock = -1;
+        for (int i = 0; i < disk.get_no_blocks(); i++) {
+            if (fat[i] == FAT_FREE) { freeBlock = i; break; }
         }
-        // Directory is full, no blocks available
-        if (emptyBlock == -1)
-        {
-            return 7; 
+        if (freeBlock == -1) return 10; // no space
 
-        } 
-        destNewBlocks.push_back(emptyBlock);
+        destNewBlocks.push_back(freeBlock);
 
-        uint8_t buffer[BLOCK_SIZE]{};
+        uint8_t buf[BLOCK_SIZE] = {};
         int bytesToWrite = std::min(sourceFileBytesLeft, BLOCK_SIZE);
-        memcpy(buffer, sourceFileData.data() + bytesWritten, bytesToWrite);
+        memcpy(buf, sourceFileData.data() + bytesWritten, bytesToWrite);
 
-        if (disk.write(emptyBlock, buffer) != 0) 
-        {
-            return 8;
-        }
+        if (disk.write(freeBlock, buf) != 0)
+            return 11;
 
         bytesWritten += bytesToWrite;
         sourceFileBytesLeft -= bytesToWrite;
     }
 
-    // Link new blocks together
-    for (int i = 0; i < destNewBlocks.size(); i++)
-    {
-        if (i + 1 < destNewBlocks.size())
-        {
-            fat[destNewBlocks[i]] = destNewBlocks[i + 1];
-        }
-        else
-        {
-            fat[destNewBlocks[i]] = FAT_EOF;
-        }
+    // Link new blocks
+    for (int i = 0; i < (int)destNewBlocks.size(); i++) {
+        fat[destNewBlocks[i]] = (i + 1 < (int)destNewBlocks.size())
+                              ? destNewBlocks[i + 1]
+                              : FAT_EOF;
     }
 
-    //  Attach to destination FAT chain
-    if (destFile->first_blk == 0xFFFF) // empty file
-    {
+    // Attach to destination file
+    if (destFile->first_blk == 0xFFFF) {
         destFile->first_blk = destNewBlocks[0];
-    }
-    else if (!destNewBlocks.empty())
-    {
+    } else if (!destNewBlocks.empty()) {
         int16_t lastBlock = destFile->first_blk;
         while (fat[lastBlock] != FAT_EOF)
-        {
             lastBlock = fat[lastBlock];
-        }
         fat[lastBlock] = destNewBlocks[0];
     }
 
     // Update size
     destFile->size += sourceFileData.size();
 
-    // Write FAT and root back to disk
-    if (disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0) 
-    {
-        return 9;
-    }
-    if (disk.write(ROOT_BLOCK, rootBuffer) != 0) 
-    {
-        return 10;
-    }
+    // --- 6. Save back ---
+    if (disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
+        return 12;
+    if (disk.write(dstDirBlock, dstBuf) != 0)
+        return 13;
 
     return 0;
 }
 
 // mkdir <dirpath> creates a new sub-directory with the name <dirpath>
 // in the current directory
-int
-FS::mkdir(std::string dirpath)
-{
-     // Check max length for file name
-    if (dirpath.size() >= 56)
-    {
-        //std::cout << "Error: Filename too long (55 characters maximum)" << std::endl;
-        return 1;
-    }
+int 
+FS::mkdir(std::string dirpath) {
+    // 1. Split path into parent + name
+    std::string parentPath, newName;
+    splitParentPath(dirpath, parentPath, newName);
 
-    uint8_t parentBuffer[BLOCK_SIZE];
-    if (disk.read(currentDirectory, parentBuffer) != 0)
-    {
-        return 2;
-    }
+    // 2. Resolve parent directory
+    uint16_t parentBlock;
+    int res = resolvePath(parentPath, true, parentBlock);
+    if (res != 0) return res;
 
-    uint16_t parentBlock = currentDirectory;
-    // Check if dirname already exists in the parent directory
-    dir_entry* parentDir_entries = reinterpret_cast<dir_entry*>(parentBuffer);
-    int number_of_entries = BLOCK_SIZE / sizeof(dir_entry);
-    for (int i = 0; i < number_of_entries; i++)
-    {
-        if (parentDir_entries[i].file_name[0] != '\0')
-        {
-            if (strcmp(parentDir_entries[i].file_name, dirpath.c_str()) == 0)
-            {
-                std::cout << "ERROR: \"" << dirpath << "\" directory name already exists." << std::endl;
-                return 3;
-            }
+    // 3. Check if name already exists in parent
+    uint8_t buf[BLOCK_SIZE];
+    if (disk.read(parentBlock, buf) != 0) return 1;
+    dir_entry* entries = reinterpret_cast<dir_entry*>(buf);
+
+    for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) {
+        if (strcmp(entries[i].file_name, newName.c_str()) == 0) {
+            return 2; // already exists
         }
     }
 
-    // Check if parent has room
-    bool roomInParent = false;
-    for (int i = 0; i < number_of_entries; i++)
-    {
-        if (parentDir_entries[i].file_name[0] == '\0')
-        {
-            roomInParent = true;
+    // 4. Allocate a free block for the new directory
+    if (disk.read(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0) return 3;
+    int16_t newBlock = -1;
+    for (int i = 0; i < disk.get_no_blocks(); i++) {
+        if (fat[i] == FAT_FREE) {
+            newBlock = i;
             break;
         }
     }
-    if (!roomInParent)
-    {
-        return 4;
-    }
+    if (newBlock == -1) return 4; // no space
+    fat[newBlock] = FAT_EOF;
 
-    if (disk.read(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
-    {
-        return 5;
-    }
+    // 5. Initialize new directory block
+    uint8_t newBuf[BLOCK_SIZE];
+    memset(newBuf, 0, BLOCK_SIZE);
+    dir_entry* newEntries = reinterpret_cast<dir_entry*>(newBuf);
 
-    // Find free block for subdir 
-    int freeBlock = -1;
-    for (int i = 2; i < disk.get_no_blocks(); i++)
-    {
-        if (fat[i] == FAT_FREE)
-        {
-            freeBlock = i;
+    // '..' entry
+    strcpy(newEntries[0].file_name, "..");
+    newEntries[0].first_blk = parentBlock;
+    newEntries[0].type = TYPE_DIR;
+    newEntries[0].size = 0;
+
+    disk.write(newBlock, newBuf);
+
+    // 6. Add new entry in parent directory
+    for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) {
+        if (entries[i].file_name[0] == '\0') {
+            strcpy(entries[i].file_name, newName.c_str());
+            entries[i].first_blk = newBlock;
+            entries[i].type = TYPE_DIR;
+            entries[i].size = 0;
             break;
         }
     }
-    if (freeBlock == -1)
-    {
-        return 6;
-    }
-    fat[freeBlock] = FAT_EOF;
+    disk.write(parentBlock, buf);
 
-    uint8_t subDirBuffer[BLOCK_SIZE]{};
-    dir_entry* subDir_entries = reinterpret_cast<dir_entry*>(subDirBuffer);
-
-    dir_entry parentEntry{};
-    strncpy(parentEntry.file_name, "..", sizeof(parentEntry.file_name) - 1);
-    parentEntry.file_name[sizeof(parentEntry.file_name) - 1] = '\0';
-    parentEntry.type = TYPE_DIR;
-    parentEntry.first_blk = currentDirectory;
-    parentEntry.size = 0;
-    parentEntry.access_rights = READ | WRITE | EXECUTE;
-    subDir_entries[0] = parentEntry;
-
-    if (disk.write(freeBlock, subDirBuffer) != 0)
-    {
-        return 7;
-    }
-
-    if (disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
-    {
-        return 8;
-    }
-
-    dir_entry subDirEntry{};
-    strncpy(subDirEntry.file_name, dirpath.c_str(), sizeof(subDirEntry.file_name) - 1);
-    subDirEntry.file_name[sizeof(subDirEntry.file_name) - 1] = '\0';
-    subDirEntry.type = TYPE_DIR;
-    subDirEntry.first_blk = freeBlock;
-    subDirEntry.size = 0;
-    subDirEntry.access_rights = READ | WRITE | EXECUTE;
-
-    for (int i = 0; i < number_of_entries; i++)
-    {
-        if (parentDir_entries[i].file_name[0] == '\0')
-        {
-            parentDir_entries[i] = subDirEntry;
-            break;
-        }
-    }
-
-    if (disk.write(currentDirectory, parentBuffer) != 0)
-    {
-        return 9;
-    }
+    // 7. Save FAT
+    disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat));
 
     return 0;
 }
@@ -1091,57 +927,10 @@ FS::mkdir(std::string dirpath)
 int
 FS::cd(std::string dirpath)
 {
-    // Move to parent directory from a sub directory
-    if (dirpath == "..")
-    {
-        if (currentDirectory == ROOT_BLOCK)
-        {
-            return 0;
-        }
-
-        uint8_t parentBuffer[BLOCK_SIZE];
-        if (disk.read(currentDirectory, parentBuffer) != 0)
-        {
-            return 1;
-        }
-
-        dir_entry* parentDir_entries = reinterpret_cast<dir_entry*>(parentBuffer);
-        currentDirectory = parentDir_entries[0].first_blk;
-
-        //std::cout << "Going up to parent directory " << currentDirectory << std::endl;
-        return 0; // Return succesfully
-    }
-
-    uint8_t subDirBuffer[BLOCK_SIZE];
-    if (disk.read(currentDirectory, subDirBuffer) != 0)
-    {
-        return 2;
-    }
-
-    dir_entry* subDir_entries = reinterpret_cast<dir_entry*>(subDirBuffer);
-    int number_of_entries = BLOCK_SIZE / sizeof(dir_entry);
-    bool directoryFound = false;
-    for (int i = 0; i < number_of_entries; i++)
-    {
-        if (subDir_entries[i].file_name[0] != '\0')
-        {
-            if (strcmp(subDir_entries[i].file_name, dirpath.c_str()) == 0)
-            {
-                if (subDir_entries[i].type == TYPE_DIR)
-                {
-                    currentDirectory = subDir_entries[i].first_blk;
-                    directoryFound = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    if (!directoryFound)
-    {
-        return 3;
-    }
-        
+    uint16_t block;
+    int res = resolvePath(dirpath, true, block);
+    if (res != 0) return res;
+    currentDirectory = block;
     return 0;
 }
 
@@ -1150,7 +939,6 @@ FS::cd(std::string dirpath)
 int
 FS::pwd()
 {
-
     if (currentDirectory == ROOT_BLOCK)
     {
         std::cout << "/" << std::endl;
@@ -1199,7 +987,7 @@ FS::pwd()
     }
 
     std::cout << "/";
-    for (int i = filePath.size() - 1; i >= 0; i--)
+    for (int i = (int)filePath.size() - 1; i >= 0; i--)
     {
         std::cout << filePath[i];
         if (i != 0)
