@@ -444,6 +444,14 @@ FS::cp(std::string sourcepath, std::string destpath)
         return 5;
     dir_entry* dstEntries = reinterpret_cast<dir_entry*>(dstDirBuf);
 
+    // --- Check WRITE on destination parent ---
+    if (dstDirBlock != ROOT_BLOCK) {
+        if (!(dstEntries[0].access_rights & WRITE)) {
+            std::cout << "No WRITE rights on destination parent directory\n";
+            return -9;
+        }
+    }
+
     // If destpath refers to an existing directory, copy inside it with same name
     if (!dstName.empty()) {
         for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) {
@@ -533,7 +541,7 @@ FS::cp(std::string sourcepath, std::string destpath)
     newFile.first_blk = freeBlocks.empty() ? 0xFFFF : freeBlocks[0];
     newFile.size = fileData.size();
     newFile.type = TYPE_FILE;
-    newFile.access_rights = READ | WRITE;
+    newFile.access_rights = srcFile->access_rights;
 
     bool inserted = false;
     for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) {
@@ -584,6 +592,14 @@ FS::mv(std::string sourcepath, std::string destpath)
     }
     if (!srcFile) return 3; // not found
 
+     // --- Check WRITE on source parent ---
+    if (srcDirBlock != ROOT_BLOCK) {
+        if (!(srcEntries[0].access_rights & WRITE)) {
+            std::cout << "No WRITE rights on source parent directory\n";
+            return -9;
+        }
+    }
+
     // --- Split dest path ---
     std::string dstParent, dstName;
     splitParentPath(destpath, dstParent, dstName);
@@ -597,6 +613,15 @@ FS::mv(std::string sourcepath, std::string destpath)
     if (disk.read(dstDirBlock, dstBuf) != 0)
         return 5;
     dir_entry* dstEntries = reinterpret_cast<dir_entry*>(dstBuf);
+
+     // --- Rights check: destination directory must allow WRITE ---
+    // --- Check WRITE on destination parent ---
+    if (dstDirBlock != ROOT_BLOCK) {
+        if (!(dstEntries[0].access_rights & WRITE)) {
+            std::cout << "No WRITE rights on destination parent directory\n";
+            return -10;
+        }
+    }
 
     // --- If dest is an existing directory, move into it ---
     if (!dstName.empty()) {
@@ -674,23 +699,9 @@ FS::rm(std::string filepath)
     dir_entry* dir_entries = reinterpret_cast<dir_entry*>(dirBuffer);
     int number_of_entries = BLOCK_SIZE / sizeof(dir_entry);
 
-    // --- 3b. Check WRITE permission on parent directory ---
-    if (parentBlock != ROOT_BLOCK) { 
-        // Follow ".." to grandparent
-        uint16_t grandParentBlock = dir_entries[0].first_blk;
-        uint8_t gpBuf[BLOCK_SIZE];
-        if (disk.read(grandParentBlock, gpBuf) != 0)
-            return 12;
-
-        dir_entry* gpEntries = reinterpret_cast<dir_entry*>(gpBuf);
-        dir_entry* parentEntry = nullptr;
-        for (int i = 0; i < number_of_entries; i++) {
-            if (gpEntries[i].first_blk == parentBlock) {
-                parentEntry = &gpEntries[i];
-                break;
-            }
-        }
-        if (parentEntry && !(parentEntry->access_rights & WRITE)) {
+    // 3b. Check WRITE permission on parent directory
+    if (parentBlock != ROOT_BLOCK) {  // root always allowed
+        if (!(dir_entries[0].access_rights & WRITE)) {
             std::cout << "No WRITE rights on parent directory" << std::endl;
             return -9;
         }
@@ -706,12 +717,6 @@ FS::rm(std::string filepath)
         }
     }
     if (!entryToRemove) return 3; // not found
-
-    // Check WRITE rights on target itself
-    if (!(entryToRemove->access_rights & WRITE)) {
-        std::cout << "No WRITE rights on target file/dir" << std::endl;
-        return -10;
-    }
 
     // --- 5. Handle directory case ---
     if (entryToRemove->type == TYPE_DIR) {
@@ -946,28 +951,12 @@ FS::mkdir(std::string dirpath) {
     dir_entry* entries = reinterpret_cast<dir_entry*>(buf);
 
     // 3b. Check WRITE permission on parent directory
-    if (parentBlock != ROOT_BLOCK) {
-        uint16_t grandParentBlock = entries[0].first_blk; // ".."
-        uint8_t gpBuf[BLOCK_SIZE];
-        if (disk.read(grandParentBlock, gpBuf) != 0)
-            return 11;
-
-        dir_entry* gpEntries = reinterpret_cast<dir_entry*>(gpBuf);
-        dir_entry* parentEntry = nullptr;
-        int numEntries = BLOCK_SIZE / sizeof(dir_entry);
-        for (int i = 0; i < numEntries; i++) {
-            if (gpEntries[i].first_blk == parentBlock) {
-                parentEntry = &gpEntries[i];
-                break;
-            }
-        }
-        if (parentEntry && !(parentEntry->access_rights & WRITE)) {
+    if (parentBlock != ROOT_BLOCK) {  // root always allowed
+        if (!(entries[0].access_rights & WRITE)) {
             std::cout << "No WRITE rights on parent directory" << std::endl;
             return -9;
         }
     }
-
-
 
     // 4. Check if name already exists in parent
     for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) {
@@ -1120,6 +1109,14 @@ FS::chmod(std::string accessrights, std::string filepath)
     uint8_t buf[BLOCK_SIZE];
     if (disk.read(parentBlock, buf) != 0) return 3;
     dir_entry* entries = reinterpret_cast<dir_entry*>(buf);
+
+     // --- Check WRITE rights on the parent directory ---
+    if (parentBlock != ROOT_BLOCK) {
+        if (!(entries[0].access_rights & WRITE)) {
+            std::cout << "ERROR: no WRITE rights on parent directory\n";
+            return -6;
+        }
+    }
 
     // Find target entry
     dir_entry* target = nullptr;
