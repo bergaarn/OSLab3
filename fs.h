@@ -31,9 +31,9 @@ private:
     int16_t fat[BLOCK_SIZE/2];
     uint16_t currentDirectory = ROOT_BLOCK;
     
-    int resolvePath(const std::string& path, bool mustBeDir, uint16_t& outBlock);
     void splitParentPath(const std::string& path, std::string& parent, std::string& name);
-    std::string rightsToString(uint8_t rights);
+    int resolvePath(const std::string& path, bool mustBeDir, uint16_t& outBlock);
+    std::string rightsTripletString(uint8_t rights);
 
 public:
     FS();
