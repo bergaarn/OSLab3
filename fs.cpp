@@ -17,10 +17,8 @@ FS::~FS()
 
 }
 
-// Splits a path into parent path + filename
-// e.g. "/foo/bar.txt"  -> parent="/foo",  name="bar.txt"
-//      "docs/readme"   -> parent="docs",  name="readme"
-//      "file.txt"      -> parent="current directory",     name="file.txt"
+// Splits a path into parent path + filename in the form of:
+// path = "/folder/file.txt" into parent = "/folder" + name = "file.txt"
 void
 FS::splitParentPath(const std::string& path, std::string& parent, std::string& name) 
 {
@@ -28,25 +26,25 @@ FS::splitParentPath(const std::string& path, std::string& parent, std::string& n
     size_t pos = path.find_last_of('/');
     if (pos == std::string::npos) 
     {
-        // No '/' -> parent is current directory
+        // No '/' means parent is current directory
         parent = "";
         name = path;
     } 
     else if (pos == 0) 
     {
-        // Path like "/file" -> parent is root
+        // Path like "/file" means parent is root
         parent = "/";
         name = path.substr(1);
     } 
     else
     {
-        // General case
+        // Default case
         parent = path.substr(0, pos);
         name = path.substr(pos + 1);
     }
 }
-
-int               // Path to resolve | Directory Flag | Disk block requested
+//                  Path to resolve | Directory Flag | Disk block requested
+int              
 FS::resolvePath(const std::string& path, bool mustBeDir, uint16_t& outBlock) 
 {
     // Determine absolute or relative path
@@ -172,12 +170,12 @@ FS::format()
     memset(rootBuf, 0, BLOCK_SIZE);
     dir_entry* rootEntries = reinterpret_cast<dir_entry*>(rootBuf);
 
-    // Add ".." entry that points to root itself
+    // root's ".." points to itself for consistency with helper functions
     strcpy(rootEntries[0].file_name, "..");
-    rootEntries[0].first_blk = ROOT_BLOCK;  // root points to itself
+    rootEntries[0].first_blk = ROOT_BLOCK;  
     rootEntries[0].type = TYPE_DIR;
     rootEntries[0].size = 0;
-    rootEntries[0].access_rights = READ | WRITE | EXECUTE;  // rwx for root
+    rootEntries[0].access_rights = READ | WRITE | EXECUTE;  // Default for root: RWX
 
     // Write root block
     if (disk.write(ROOT_BLOCK, rootBuf) != 0)
@@ -288,9 +286,10 @@ FS::create(std::string filepath)
                 break; 
             }
         }
+        // No free blocks in FAT
         if (freeBlock == -1)
         {
-            return 6; // no space
+            return 6;
         } 
 
         freeBlocks.push_back(freeBlock);
@@ -354,6 +353,7 @@ FS::create(std::string filepath)
 }
 
 // cat <filepath> reads the content of a file and prints it on the screen
+// in the format of "Folder/SubFolder/File" or "/Folder/SubFolder/file"
 int
 FS::cat(std::string filepath) 
 {
@@ -371,10 +371,10 @@ FS::cat(std::string filepath)
     uint8_t buf[BLOCK_SIZE];
     if (disk.read(parentBlock, buf) != 0)
     {
-        return -1;
+        return 1;
     }
+
     dir_entry* entries = reinterpret_cast<dir_entry*>(buf);
-    
     dir_entry* targetFile = nullptr;
 
     for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) 
@@ -396,17 +396,17 @@ FS::cat(std::string filepath)
     } 
     if (!(targetFile->access_rights & READ))
     {
-        std::cout << "ERROR: no read permission\n";
-        return -6;
+        //std::cout << "ERROR: no read permission\n";
+        return 4;
     }
 
     // Load FAT
     if (disk.read(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
     {
-        return 4;
+        return 5;
     }
 
-    // --- Walk file blocks and print ---
+    // Traverse file blocks and print
     int16_t fileBlock = static_cast<int16_t>(targetFile->first_blk);
     int bytesToRead = targetFile->size;
 
@@ -415,7 +415,7 @@ FS::cat(std::string filepath)
         uint8_t blockBuffer[BLOCK_SIZE];
         if (disk.read(fileBlock, blockBuffer) != 0)
         {
-            return 5;
+            return 6;
         }
 
         int bytesToPrint = std::min(bytesToRead, BLOCK_SIZE);
@@ -502,96 +502,94 @@ FS::ls()
 int 
 FS::cp(std::string sourcepath, std::string destpath)
 {
-    // --- Split source path ---
-    std::string srcParent, srcName;
-    splitParentPath(sourcepath, srcParent, srcName);
+    // Split source path
+    std::string sourceParent, sourceName;
+    splitParentPath(sourcepath, sourceParent, sourceName);
 
-    // --- Resolve source parent directory ---
-    uint16_t srcDirBlock;
-    if (resolvePath(srcParent, true, srcDirBlock) != 0)
+    // Resolve source parent directory
+    uint16_t sourceDirBlock;
+    int retVal = resolvePath(sourceParent, true, sourceDirBlock);
+    if (retVal != 0)
     {   
-        return 1; // source parent invalid
+        return retVal; // source parent invalid
     }
         
-    // --- Find source file ---
-    uint8_t srcDirBuf[BLOCK_SIZE];
-    if (disk.read(srcDirBlock, srcDirBuf) != 0)
+    // Find source file
+    uint8_t sourceDirBuf[BLOCK_SIZE];
+    if (disk.read(sourceDirBlock, sourceDirBuf) != 0)
     {
         return 2;
     }
         
-    dir_entry* srcEntries = reinterpret_cast<dir_entry*>(srcDirBuf);
-    dir_entry* srcFile = nullptr;
+    dir_entry* sourceEntries = reinterpret_cast<dir_entry*>(sourceDirBuf);
+    dir_entry* sourceFile = nullptr;
     for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) 
     {
-        if (srcEntries[i].file_name[0] != '\0' && strcmp(srcEntries[i].file_name, srcName.c_str()) == 0) 
+        if (sourceEntries[i].file_name[0] != '\0' && strcmp(sourceEntries[i].file_name, sourceName.c_str()) == 0) 
         {
-            srcFile = &srcEntries[i];
+            sourceFile = &sourceEntries[i];
             break;
         }
     }
 
-    if (!srcFile || srcFile->type != TYPE_FILE)
+    if (!sourceFile || sourceFile->type != TYPE_FILE)
     {
         return 3; // source not found or is a dir
     }
-     // --- Access rights: must be READable ---
-    if (!(srcFile->access_rights & READ)) 
+     // Access rights: must be readable
+    if (!(sourceFile->access_rights & READ)) 
     {
-        std::cout << "ERROR: no READ permission on " << srcFile->file_name << "\n";
-        return -6;
+        std::cout << "ERROR: no READ permission on " << sourceFile->file_name << "\n";
+        return 4;
     }
 
-    // --- Handle destination ---
-    std::string dstParent, dstName;
-    splitParentPath(destpath, dstParent, dstName);
+    // Handle destination
+    std::string destParent, destName;
+    splitParentPath(destpath, destParent, destName);
 
-    uint16_t dstDirBlock;
-    if (resolvePath(dstParent, true, dstDirBlock) != 0)
+    uint16_t destDirBlock;
+    retVal = resolvePath(destParent, true, destDirBlock);
+    if (retVal != 0)
     {
-        return 4; // invalid dest parent
+        return retVal; // invalid dest parent
     }
         
     // Load destination directory
-    uint8_t dstDirBuf[BLOCK_SIZE];
-    if (disk.read(dstDirBlock, dstDirBuf) != 0)
+    uint8_t destDirBuf[BLOCK_SIZE];
+    if (disk.read(destDirBlock, destDirBuf) != 0)
     {
         return 5;
     }
     
-    dir_entry* dstEntries = reinterpret_cast<dir_entry*>(dstDirBuf);
+    dir_entry* destEntries = reinterpret_cast<dir_entry*>(destDirBuf);
 
-    // --- Check WRITE on destination parent ---
-    if (dstDirBlock != ROOT_BLOCK) 
+    // Check WRITE on destination parent
+    if (destDirBlock != ROOT_BLOCK) 
     {
-        if (!(dstEntries[0].access_rights & WRITE)) 
+        if (!(destEntries[0].access_rights & WRITE)) 
         {
             std::cout << "No WRITE rights on destination parent directory\n";
-            return -9;
+            return 6;
         }
     }
 
     // If destpath refers to an existing directory, copy inside it with same name
-    if (!dstName.empty()) 
+    if (!destName.empty()) 
     {
         for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) 
         {
-            if (dstEntries[i].file_name[0] != '\0' && strcmp(dstEntries[i].file_name, dstName.c_str()) == 0 && dstEntries[i].type == TYPE_DIR) 
+            if (destEntries[i].file_name[0] != '\0' && strcmp(destEntries[i].file_name, destName.c_str()) == 0 && destEntries[i].type == TYPE_DIR) 
             {
-                // It's a directory → adjust
-                dstParent = destpath;
-                dstName = srcName;
-                if (resolvePath(dstParent, true, dstDirBlock) != 0)
-                {
-                    return 6;
-                }
-                    
-                if (disk.read(dstDirBlock, dstDirBuf) != 0)
+                // Adjust if it's a directory
+                destDirBlock = destEntries[i].first_blk; 
+                destName = sourceName;
+
+                if (disk.read(destDirBlock, destDirBuf) != 0)
                 {
                     return 7;
                 }
                     
-                dstEntries = reinterpret_cast<dir_entry*>(dstDirBuf);
+                destEntries = reinterpret_cast<dir_entry*>(destDirBuf);
                 break;
             }
         }
@@ -599,28 +597,28 @@ FS::cp(std::string sourcepath, std::string destpath)
     else
     {
         // Path ended with "/" → means directory, keep same name
-        dstName = srcName;
+        destName = sourceName;
     }
 
-    // Ensure file with dstName doesn’t already exist
+    // Ensure file with destName doesn’t already exist
     for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) 
     {
-        if (dstEntries[i].file_name[0] != '\0' && strcmp(dstEntries[i].file_name, dstName.c_str()) == 0) 
+        if (destEntries[i].file_name[0] != '\0' && strcmp(destEntries[i].file_name, destName.c_str()) == 0) 
         {
             return 8; // already exists
         }
     }
 
-    // --- Load FAT ---
+    // Load FAT
     if (disk.read(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
     {
         return 9;
     }
         
-    // --- Copy file data into string ---
+    // Copy file data into string
     std::string fileData;
-    int16_t block = srcFile->first_blk;
-    int bytesLeft = srcFile->size;
+    int16_t block = sourceFile->first_blk;
+    int bytesLeft = sourceFile->size;
 
     while (block != FAT_EOF && bytesLeft > 0) 
     {
@@ -636,7 +634,7 @@ FS::cp(std::string sourcepath, std::string destpath)
         block = fat[block];
     }
 
-    // --- Allocate new blocks for copy ---
+    // Allocate new blocks for copy
     std::vector<uint16_t> freeBlocks;
     int bytesWritten = 0;
     int bytesLeftToWrite = fileData.size();
@@ -672,7 +670,7 @@ FS::cp(std::string sourcepath, std::string destpath)
         bytesLeftToWrite -= bytesToWrite;
     }
 
-    // --- Link blocks in FAT ---
+    // Link blocks in FAT
     for (int i = 0; i < freeBlocks.size(); i++) 
     {
         fat[freeBlocks[i]] = (i + 1 < freeBlocks.size()) ? freeBlocks[i + 1] : FAT_EOF;
@@ -683,21 +681,21 @@ FS::cp(std::string sourcepath, std::string destpath)
         return 13;
     }   
 
-    // --- Create new dir_entry in destination ---
+    // Create new dir_entry in destination
     dir_entry newFile{};
-    strncpy(newFile.file_name, dstName.c_str(), sizeof(newFile.file_name) - 1);
+    strncpy(newFile.file_name, destName.c_str(), sizeof(newFile.file_name) - 1);
     newFile.file_name[sizeof(newFile.file_name) - 1] = '\0';
     newFile.first_blk = freeBlocks.empty() ? 0xFFFF : freeBlocks[0];
     newFile.size = fileData.size();
     newFile.type = TYPE_FILE;
-    newFile.access_rights = srcFile->access_rights;
+    newFile.access_rights = sourceFile->access_rights;
 
     bool inserted = false;
     for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) 
     {
-        if (dstEntries[i].file_name[0] == '\0') 
+        if (destEntries[i].file_name[0] == '\0') 
         {
-            dstEntries[i] = newFile;
+            destEntries[i] = newFile;
             inserted = true;
             break;
         }
@@ -708,7 +706,7 @@ FS::cp(std::string sourcepath, std::string destpath)
         return 14; // no space in directory
     } 
 
-    if (disk.write(dstDirBlock, dstDirBuf) != 0)
+    if (disk.write(destDirBlock, destDirBuf) != 0)
     {
         return 15;
     }
@@ -726,104 +724,100 @@ FS::mv(std::string sourcepath, std::string destpath)
         return 0;
     } 
 
-    // --- Split source path ---
-    std::string srcParent, srcName;
-    splitParentPath(sourcepath, srcParent, srcName);
+    // Split source path
+    std::string sourceParent, sourceName;
+    splitParentPath(sourcepath, sourceParent, sourceName);
 
-    uint16_t srcDirBlock;
-    if (resolvePath(srcParent, true, srcDirBlock) != 0)
+    uint16_t sourceDirBlock;
+    int retVal = resolvePath(sourceParent, true, sourceDirBlock);
+    if (retVal != 0)
     {
-        return 1; // invalid source parent
+        return retVal; // invalid source parent
     }
 
-    // --- Load source dir ---
-    uint8_t srcBuf[BLOCK_SIZE];
-    if (disk.read(srcDirBlock, srcBuf) != 0)
+    // Load source dir
+    uint8_t sourceBuf[BLOCK_SIZE];
+    if (disk.read(sourceDirBlock, sourceBuf) != 0)
     {
-        return 2;
+        return 1;
     }
         
-    dir_entry* srcEntries = reinterpret_cast<dir_entry*>(srcBuf);
+    dir_entry* sourceEntries = reinterpret_cast<dir_entry*>(sourceBuf);
 
-    // --- Find source entry ---
-    dir_entry* srcFile = nullptr;
+    // Find source entry
+    dir_entry* sourceFile = nullptr;
     int numEntries = BLOCK_SIZE / sizeof(dir_entry);
     for (int i = 0; i < numEntries; i++) 
     {
-        if (srcEntries[i].file_name[0] != '\0' && strcmp(srcEntries[i].file_name, srcName.c_str()) == 0) 
+        if (sourceEntries[i].file_name[0] != '\0' && strcmp(sourceEntries[i].file_name, sourceName.c_str()) == 0) 
         {
-            srcFile = &srcEntries[i];
+            sourceFile = &sourceEntries[i];
             break;
         }
     }
 
-    if (!srcFile) 
+    if (!sourceFile) 
     {
-        return 3; // not found
+        return 2; // not found
     }
 
-     // --- Check WRITE on source parent ---
-    if (srcDirBlock != ROOT_BLOCK) 
+     // Check WRITE on source parent
+    if (sourceDirBlock != ROOT_BLOCK) 
     {
-        if (!(srcEntries[0].access_rights & WRITE)) 
+        if (!(sourceEntries[0].access_rights & WRITE)) 
         {
             std::cout << "No WRITE rights on source parent directory\n";
-            return -9;
+            return 3;
         }
     }
 
-    // --- Split dest path ---
-    std::string dstParent, dstName;
-    splitParentPath(destpath, dstParent, dstName);
+    // Split dest path
+    std::string destParent, destName;
+    splitParentPath(destpath, destParent, destName);
 
-    uint16_t dstDirBlock;
-    if (resolvePath(dstParent, true, dstDirBlock) != 0)
+    uint16_t destDirBlock;
+    retVal = resolvePath(destParent, true, destDirBlock);
+    if (retVal != 0)
     {
-        return 4; // invalid dest parent
+        return retVal; // invalid dest parent
     }
 
-    // --- Load dest dir ---
-    uint8_t dstBuf[BLOCK_SIZE];
-    if (disk.read(dstDirBlock, dstBuf) != 0)
+    // Load dest dir
+    uint8_t destBuf[BLOCK_SIZE];
+    if (disk.read(destDirBlock, destBuf) != 0)
     {
-        return 5;
+        return 4;
     }
         
-    dir_entry* dstEntries = reinterpret_cast<dir_entry*>(dstBuf);
+    dir_entry* destEntries = reinterpret_cast<dir_entry*>(destBuf);
 
-     // --- Rights check: destination directory must allow WRITE ---
-    // --- Check WRITE on destination parent ---
-    if (dstDirBlock != ROOT_BLOCK) 
+    // Check write on destination parent
+    if (destDirBlock != ROOT_BLOCK) 
     {
-        if (!(dstEntries[0].access_rights & WRITE)) 
+        if (!(destEntries[0].access_rights & WRITE)) 
         {
             std::cout << "No WRITE rights on destination parent directory\n";
-            return -10;
+            return 5;
         }
     }
 
-    // --- If dest is an existing directory, move into it ---
-    if (!dstName.empty()) 
+    // If dest is an existing directory, move into it
+    if (!destName.empty()) 
     {
         for (int i = 0; i < numEntries; i++) 
         {
-            if (dstEntries[i].file_name[0] != '\0' && strcmp(dstEntries[i].file_name, dstName.c_str()) == 0 && dstEntries[i].type == TYPE_DIR) 
+            if (destEntries[i].file_name[0] != '\0' && strcmp(destEntries[i].file_name, destName.c_str()) == 0 && destEntries[i].type == TYPE_DIR) 
             {
                 // move into that directory, keep name
-                dstParent = destpath;
-                dstName = srcName;
+                destDirBlock = destEntries[i].first_blk;   // direct jump
+                destName = sourceName;
 
-                if (resolvePath(dstParent, true, dstDirBlock) != 0)
+                if (disk.read(destDirBlock, destBuf) != 0)
                 {
                     return 6;
                 }
                     
-                if (disk.read(dstDirBlock, dstBuf) != 0)
-                {
-                    return 7;
-                }
-                    
-                dstEntries = reinterpret_cast<dir_entry*>(dstBuf);
+                destEntries = reinterpret_cast<dir_entry*>(destBuf);
                 break;
             }
         }
@@ -831,47 +825,47 @@ FS::mv(std::string sourcepath, std::string destpath)
     else 
     {
         // path ended with '/', so use same name
-        dstName = srcName;
+        destName = sourceName;
     }
 
-    // --- Prevent overwrite ---
+    // Prevent overwrite
     for (int i = 0; i < numEntries; i++) 
     {
-        if (dstEntries[i].file_name[0] != '\0' && strcmp(dstEntries[i].file_name, dstName.c_str()) == 0) 
+        if (destEntries[i].file_name[0] != '\0' && strcmp(destEntries[i].file_name, destName.c_str()) == 0) 
         {
-            return 8; // already exists
+            return 7; // already exists
         }
     }
 
-    // --- Insert entry into dest dir ---
+    // Insert entry into dest dir
     bool inserted = false;
     for (int i = 0; i < numEntries; i++) 
     {
-        if (dstEntries[i].file_name[0] == '\0') 
+        if (destEntries[i].file_name[0] == '\0') 
         {
-            dir_entry moved = *srcFile;
-            strncpy(moved.file_name, dstName.c_str(), sizeof(moved.file_name) - 1);
+            dir_entry moved = *sourceFile;
+            strncpy(moved.file_name, destName.c_str(), sizeof(moved.file_name) - 1);
             moved.file_name[sizeof(moved.file_name) - 1] = '\0';
-            dstEntries[i] = moved;
+            destEntries[i] = moved;
             inserted = true;
             break;
         }
     }
     if (!inserted) 
     {
-        return 9; // dest dir full
+        return 8; // dest dir full
     }
 
-    if (disk.write(dstDirBlock, dstBuf) != 0)
+    if (disk.write(destDirBlock, destBuf) != 0)
     {
-        return 10;
+        return 9;
     }
         
-    // --- Clear source entry ---
-    memset(srcFile, 0, sizeof(dir_entry));
-    if (disk.write(srcDirBlock, srcBuf) != 0)
+    // Clear source entry
+    memset(sourceFile, 0, sizeof(dir_entry));
+    if (disk.write(sourceDirBlock, sourceBuf) != 0)
     {
-        return 11;
+        return 10;
     }
         
     return 0;
@@ -881,38 +875,39 @@ FS::mv(std::string sourcepath, std::string destpath)
 int 
 FS::rm(std::string filepath)
 {
-    // --- 1. Split into parent + filename ---
+    // Split into parent + filename
     std::string parentPath, name;
     splitParentPath(filepath, parentPath, name);
 
-    // --- 2. Resolve parent directory ---
+    // Resolve parent directory
     uint16_t parentBlock;
-    if (resolvePath(parentPath, true, parentBlock) != 0)
+    int retVal = resolvePath(parentPath, true, parentBlock);
+    if (retVal != 0)
     {
-        return 1; // invalid parent path
+        return retVal; // invalid parent path
     }
         
-    // --- 3. Read parent directory ---
+    // Read parent directory
     uint8_t dirBuffer[BLOCK_SIZE];
     if (disk.read(parentBlock, dirBuffer) != 0)
     {
-        return 2;
+        return 1;
     }
         
     dir_entry* dir_entries = reinterpret_cast<dir_entry*>(dirBuffer);
     int number_of_entries = BLOCK_SIZE / sizeof(dir_entry);
 
-    // 3b. Check WRITE permission on parent directory
+    // Check write permission on parent directory
     if (parentBlock != ROOT_BLOCK) // root always allowed
     {  
         if (!(dir_entries[0].access_rights & WRITE)) 
         {
-            std::cout << "No WRITE rights on parent directory" << std::endl;
-            return -9;
+            std::cout << "No write rights on parent directory" << std::endl;
+            return 2;
         }
     }
 
-    // --- 4. Find entry to remove ---
+    // Find entry to remove
     dir_entry* entryToRemove = nullptr;
     for (int i = 0; i < number_of_entries; i++) 
     {
@@ -928,7 +923,7 @@ FS::rm(std::string filepath)
         return 3; // not found
     } 
 
-    // --- 5. Handle directory case ---
+    // Handle directory case
     if (entryToRemove->type == TYPE_DIR) 
     {
         uint8_t subDirBuffer[BLOCK_SIZE];
@@ -956,14 +951,14 @@ FS::rm(std::string filepath)
         }
     }
 
-    // --- 6. Free blocks in FAT ---
+    // Free blocks in FAT
     if (disk.read(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
     {
         return 6;
     }
         
     int16_t currentBlock = static_cast<int16_t>(entryToRemove->first_blk);
-    if (currentBlock != 0xFFFF) // guard for empty file
+    if (currentBlock != 0xFFFF) // Guard against empty file
     { 
         while (currentBlock != FAT_EOF) 
         {
@@ -973,7 +968,7 @@ FS::rm(std::string filepath)
         }
     }
 
-    // --- 7. Clear directory entry ---
+    // Clear directory entry
     memset(entryToRemove, 0, sizeof(dir_entry));
 
     if (disk.write(parentBlock, dirBuffer) != 0)
@@ -994,88 +989,90 @@ FS::rm(std::string filepath)
 int 
 FS::append(std::string filepath1, std::string filepath2)
 {
-    // --- 1. Resolve and find source file ---
-    std::string srcParent, srcName;
-    splitParentPath(filepath1, srcParent, srcName);
+    // Resolve and find source file
+    std::string sourceParent, sourceName;
+    splitParentPath(filepath1, sourceParent, sourceName);
 
-    uint16_t srcDirBlock;
-    if (resolvePath(srcParent, true, srcDirBlock) != 0)
+    uint16_t sourceDirBlock;
+    int retVal = resolvePath(sourceParent, true, sourceDirBlock);
+    if (retVal != 0)
+    {
+        return retVal;
+    }
+        
+    uint8_t sourceBuf[BLOCK_SIZE];
+    if (disk.read(sourceDirBlock, sourceBuf) != 0)
     {
         return 1;
     }
-        
-    uint8_t srcBuf[BLOCK_SIZE];
-    if (disk.read(srcDirBlock, srcBuf) != 0)
-    {
-        return 2;
-    }
 
-    dir_entry* srcEntries = reinterpret_cast<dir_entry*>(srcBuf);
+    dir_entry* sourceEntries = reinterpret_cast<dir_entry*>(sourceBuf);
     dir_entry* sourceFile = nullptr;
     for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) 
     {
-        if (strcmp(srcEntries[i].file_name, srcName.c_str()) == 0) 
+        if (strcmp(sourceEntries[i].file_name, sourceName.c_str()) == 0) 
         {
-            sourceFile = &srcEntries[i];
+            sourceFile = &sourceEntries[i];
             break;
         }
     }
 
     if (!sourceFile || sourceFile->type != TYPE_FILE)
     {
-        return 3;
+        return 2;
     }
     if (!(sourceFile->access_rights & READ)) 
     {
         std::cout << "No READ rights on source file" << std::endl;
-        return -7;
+        return 3;
     }
 
-    // --- 2. Resolve and find destination file ---
-    std::string dstParent, dstName;
-    splitParentPath(filepath2, dstParent, dstName);
+    // Resolve and find destination file
+    std::string destParent, destName;
+    splitParentPath(filepath2, destParent, destName);
 
-    uint16_t dstDirBlock;
-    if (resolvePath(dstParent, true, dstDirBlock) != 0)
+    uint16_t destDirBlock;
+    retVal = resolvePath(destParent, true, destDirBlock); 
+    if (retVal != 0)
+    {
+        return retVal;
+    }
+        
+    uint8_t destBuf[BLOCK_SIZE];
+    if (disk.read(destDirBlock, destBuf) != 0)
     {
         return 4;
     }
         
-    uint8_t dstBuf[BLOCK_SIZE];
-    if (disk.read(dstDirBlock, dstBuf) != 0)
-    {
-        return 5;
-    }
-        
-    dir_entry* dstEntries = reinterpret_cast<dir_entry*>(dstBuf);
+    dir_entry* destEntries = reinterpret_cast<dir_entry*>(destBuf);
     dir_entry* destFile = nullptr;
 
     for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) 
     {
-        if (strcmp(dstEntries[i].file_name, dstName.c_str()) == 0) 
+        if (strcmp(destEntries[i].file_name, destName.c_str()) == 0) 
         {
-            destFile = &dstEntries[i];
+            destFile = &destEntries[i];
             break;
         }
     }
 
     if (!destFile || destFile->type != TYPE_FILE)
     {
-        return 6;
+        return 5;
     }
     if (!(destFile->access_rights & WRITE))
     {
-        std::cout << "No WRITE access on destination file" << std::endl;
-        return -8;
+        std::cout << "No write access on destination file" << std::endl;
+        return 6;
     }    
 
-    // --- 3. Load FAT ---
+    // Load FAT
     if (disk.read(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
     {
         return 7;
     }
         
-    // --- 4. Read entire source file into memory ---
+    // Read entire source file into memory
     std::string sourceFileData;
     int16_t currentBlock = sourceFile->first_blk;
     int bytesLeft = sourceFile->size;
@@ -1097,10 +1094,10 @@ FS::append(std::string filepath1, std::string filepath2)
 
     if (sourceFileData.empty())
     {
-        return 0; // nothing to append
+        return 0; // nothing to append, no error, just return safely
     }
 
-    // --- 5. Append to dest ---
+    // Append to dest
     int sourceFileBytesLeft = sourceFileData.size();
     int bytesWritten = 0;
     std::vector<int16_t> destNewBlocks;
@@ -1131,7 +1128,7 @@ FS::append(std::string filepath1, std::string filepath2)
 
             if (disk.write(lastBlock, blockBuf) != 0)
             {
-                return 9;
+                return 10;
             }
 
             bytesWritten += bytesToCopy;
@@ -1152,9 +1149,10 @@ FS::append(std::string filepath1, std::string filepath2)
             }
         }
 
+        // No free blocks in FAT
         if (freeBlock == -1)
         {
-            return 10; // no space
+            return 11; 
         } 
 
         destNewBlocks.push_back(freeBlock);
@@ -1165,7 +1163,7 @@ FS::append(std::string filepath1, std::string filepath2)
 
         if (disk.write(freeBlock, buf) != 0)
         {
-            return 11;
+            return 12;
         }
             
         bytesWritten += bytesToWrite;
@@ -1196,15 +1194,15 @@ FS::append(std::string filepath1, std::string filepath2)
     // Update size
     destFile->size += sourceFileData.size();
 
-    // --- 6. Save back ---
+    // Save back
     if (disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
     {
-        return 12;
+        return 13;
     }
         
-    if (disk.write(dstDirBlock, dstBuf) != 0)
+    if (disk.write(destDirBlock, destBuf) != 0)
     {
-        return 13;
+        return 14;
     }
         
     return 0;
@@ -1215,19 +1213,19 @@ FS::append(std::string filepath1, std::string filepath2)
 int 
 FS::mkdir(std::string dirpath) 
 {
-    // 1. Split path into parent + name
+    // Split path into parent + name
     std::string parentPath, newName;
     splitParentPath(dirpath, parentPath, newName);
 
-    // 2. Resolve parent directory
+    // Resolve parent directory
     uint16_t parentBlock;
-    int res = resolvePath(parentPath, true, parentBlock);
-    if (res != 0)
+    int retVal = resolvePath(parentPath, true, parentBlock);
+    if (retVal != 0)
     {
-        return res;
+        return retVal;
     } 
 
-    // 3. Read parent directory
+    // Read parent directory
     uint8_t buf[BLOCK_SIZE];
     if (disk.read(parentBlock, buf) != 0)
     {   
@@ -1236,29 +1234,29 @@ FS::mkdir(std::string dirpath)
 
     dir_entry* entries = reinterpret_cast<dir_entry*>(buf);
 
-    // 3b. Check WRITE permission on parent directory
+    // Check write permission on parent directory
     if (parentBlock != ROOT_BLOCK)   // root always allowed
     {
         if (!(entries[0].access_rights & WRITE)) 
         {
             std::cout << "No WRITE rights on parent directory" << std::endl;
-            return -9;
+            return 2;
         }
     }
 
-    // 4. Check if name already exists in parent
+    // Check if name already exists in parent
     for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) 
     {
-        if (strcmp(entries[i].file_name, newName.c_str()) == 0) 
+        if (entries[i].file_name[0] != '\0' && strcmp(entries[i].file_name, newName.c_str()) == 0) 
         {
-            return 2; // already exists
+            return 3; // already exists
         }
     }
 
-    // 4. Allocate a free block for the new directory
+    // Allocate a free block for the new directory
     if (disk.read(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
     {
-        return 3;
+        return 4;
     } 
     
     int16_t newBlock = -1;
@@ -1270,18 +1268,20 @@ FS::mkdir(std::string dirpath)
             break;
         }
     }
+
+    // No free slots in FAT
     if (newBlock == -1)
     {
-        return 4; // no space
+        return 5;
     } 
     fat[newBlock] = FAT_EOF;
 
-    // 5. Initialize new directory block
+    // Initialize new directory block
     uint8_t newBuf[BLOCK_SIZE];
     memset(newBuf, 0, BLOCK_SIZE);
     dir_entry* newEntries = reinterpret_cast<dir_entry*>(newBuf);
 
-    // '..' entry
+    // Parent '..' entry
     strcpy(newEntries[0].file_name, "..");
     newEntries[0].first_blk = parentBlock;
     newEntries[0].type = TYPE_DIR;
@@ -1290,7 +1290,7 @@ FS::mkdir(std::string dirpath)
 
     disk.write(newBlock, newBuf);
 
-    // 6. Add new entry in parent directory
+    // Add new entry in parent directory
     for (int i = 0; i < BLOCK_SIZE / sizeof(dir_entry); i++) 
     {
         if (entries[i].file_name[0] == '\0') 
@@ -1306,13 +1306,13 @@ FS::mkdir(std::string dirpath)
     
     if (disk.write(parentBlock, buf) != 0)
     {
-        return -1;
+        return 6;
     }
 
     // 7. Save FAT
     if (disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
     {
-        return -1;
+        return 7;
     }
 
     return 0;
@@ -1322,15 +1322,15 @@ FS::mkdir(std::string dirpath)
 int
 FS::cd(std::string dirpath)
 {
-    uint16_t block;
+    uint16_t targetBlock;
     
-    int res = resolvePath(dirpath, true, block);
-    if (res != 0) 
+    int retVal = resolvePath(dirpath, true, targetBlock);
+    if (retVal != 0) 
     {
-        return res;
+        return retVal;
     }
 
-    currentDirectory = block;
+    currentDirectory = targetBlock;
     return 0;
 }
 
@@ -1339,6 +1339,7 @@ FS::cd(std::string dirpath)
 int
 FS::pwd()
 {
+    // If already at root, print and return
     if (currentDirectory == ROOT_BLOCK)
     {
         std::cout << "/" << std::endl;
@@ -1348,6 +1349,7 @@ FS::pwd()
     std::vector<std::string>filePath;
     uint16_t currentBlock = currentDirectory;
 
+    // Traverse up the file hierarchy to find root and save the path taken
     while (currentBlock != ROOT_BLOCK)
     {
         uint8_t currentBuffer[BLOCK_SIZE];
@@ -1386,6 +1388,7 @@ FS::pwd()
         currentBlock = parentBlock;
     }
 
+    // Print working directory path
     std::cout << "/";
     for (int i = (int)filePath.size() - 1; i >= 0; i--)
     {
@@ -1405,7 +1408,7 @@ FS::pwd()
 int 
 FS::chmod(std::string accessrights, std::string filepath)
 {
-    // Parse numeric rights (e.g. "6" → 0x06 → read+write)
+    // Parse access rights
     int rights = std::stoi(accessrights);
     if (rights < 0 || rights > 7) 
     {
@@ -1418,27 +1421,27 @@ FS::chmod(std::string accessrights, std::string filepath)
 
     // Resolve parent directory
     uint16_t parentBlock;
-    if (resolvePath(parentPath, true, parentBlock) != 0)
+    int retVal = resolvePath(parentPath, true, parentBlock);
+    if (retVal != 0)
     {
-        return 2;
+        return retVal;
     }
 
     // Load parent directory
     uint8_t buf[BLOCK_SIZE];
     if (disk.read(parentBlock, buf) != 0)
     {
-        return 3;
+        return 2;
     } 
-
     dir_entry* entries = reinterpret_cast<dir_entry*>(buf);
 
-     // --- Check WRITE rights on the parent directory ---
+     // Check write rights on the parent directory
     if (parentBlock != ROOT_BLOCK) 
     {
         if (!(entries[0].access_rights & WRITE)) 
         {
-            std::cout << "ERROR: no WRITE rights on parent directory\n";
-            return -6;
+            std::cout << "ERROR: no write rights on parent directory\n";
+            return 3;
         }
     }
 
