@@ -270,7 +270,7 @@ FS::create(std::string filepath)
         return 5;
     }
 
-    // Allocate blocks
+    // Allocate blocks for new file
     std::vector<uint16_t> freeBlocks;
     int textLeft = completedText.size();
     int textWritten = 0;
@@ -853,7 +853,7 @@ FS::mv(std::string sourcepath, std::string destpath)
     }
     if (!inserted) 
     {
-        return 8; // dest dir full
+        return 8; // destination directory full
     }
 
     if (disk.write(destDirBlock, destBuf) != 0)
@@ -1304,12 +1304,13 @@ FS::mkdir(std::string dirpath)
         }
     }
     
+    // Update parent directory
     if (disk.write(parentBlock, buf) != 0)
     {
         return 6;
     }
 
-    // 7. Save FAT
+    // Update FAT
     if (disk.write(FAT_BLOCK, reinterpret_cast<uint8_t*>(fat)) != 0)
     {
         return 7;
@@ -1324,6 +1325,7 @@ FS::cd(std::string dirpath)
 {
     uint16_t targetBlock;
     
+    // Update current directory using the output of targetBlock
     int retVal = resolvePath(dirpath, true, targetBlock);
     if (retVal != 0) 
     {
@@ -1346,7 +1348,7 @@ FS::pwd()
         return 0;
     }
 
-    std::vector<std::string>filePath;
+    std::vector<std::string> filePath;
     uint16_t currentBlock = currentDirectory;
 
     // Traverse up the file hierarchy to find root and save the path taken
@@ -1384,6 +1386,7 @@ FS::pwd()
             }
         }
 
+        // Add current the current path taken to the total path and move up to parent
         filePath.push_back(currentPath);
         currentBlock = parentBlock;
     }
